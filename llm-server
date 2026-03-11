@@ -34,6 +34,7 @@ CTX_SIZE="${LLM_CTX_SIZE:-65536}"
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 CACHE_DIR="$HOME/.cache/llm-server"
 SERVER_LOG="/tmp/llm-server.log"
+LIB_HUB_DIR=""
 
 RETUNE=0
 DRY_RUN=0
@@ -44,6 +45,37 @@ MODEL_ARG=""
 USER_SERVER_BIN=""
 USER_LIB_PATH=""
 KV_QUALITY="mid"  # high (f16), mid (q8_0, default), low (q4_0)
+
+# Cleanup on exit
+cleanup() {
+    if [[ -n "${LIB_HUB_DIR:-}" && -d "$LIB_HUB_DIR" ]]; then
+        rm -rf "$LIB_HUB_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# Create a "Lib Hub" (symlink all found .so files into one temp dir)
+# This solves the issue where libraries are scattered in build subfolders.
+setup_lib_hub() {
+    local bin_path="$1"
+    local build_root
+    build_root="$(dirname "$(dirname "$bin_path")")"
+    
+    if [[ ! -d "$build_root" ]]; then return; fi
+
+    # Create fresh hub dir
+    [[ -n "$LIB_HUB_DIR" && -d "$LIB_HUB_DIR" ]] && rm -rf "$LIB_HUB_DIR"
+    LIB_HUB_DIR=$(mktemp -d /tmp/llm-lib-hub.XXXXXX)
+    
+    # Find and symlink all .so files
+    find "$build_root" -name "*.so" -type f -exec ln -sf {} "$LIB_HUB_DIR/" \; 2>/dev/null
+    
+    # Export the hub to the library path
+    export LD_LIBRARY_PATH="$LIB_HUB_DIR:${LD_LIBRARY_PATH:-}"
+    
+    # Also add the binary's directory for good measure
+    export LD_LIBRARY_PATH="$(dirname "$bin_path"):$LD_LIBRARY_PATH"
+}
 
 # Auto-detect llama-server binary
 find_server_binary() {
@@ -65,17 +97,9 @@ find_server_binary() {
 
 LLAMA_SERVER="$(find_server_binary)"
 
-# Ensure shared libraries are found (e.g. libmtmd.so built in sibling dirs)
+# Initial lib hub setup
 if [[ -n "$LLAMA_SERVER" ]]; then
-    _server_dir="$(dirname "$LLAMA_SERVER")"
-    _build_root="${_server_dir%/bin}"
-    _lib_paths="$_server_dir"
-    # Add all directories containing .so files under the build root
-    while IFS= read -r d; do
-        _lib_paths="$_lib_paths:$d"
-    done < <(find "$_build_root" -name '*.so' -printf '%h\n' 2>/dev/null | sort -u)
-    export LD_LIBRARY_PATH="${_lib_paths}:${LD_LIBRARY_PATH:-}"
-    unset _server_dir _build_root _lib_paths
+    setup_lib_hub "$LLAMA_SERVER"
 fi
 
 # Note: --server-bin and --lib-path are applied after arg parsing (see below)
@@ -128,15 +152,8 @@ if [[ -n "$USER_SERVER_BIN" ]]; then
         exit 1
     fi
     LLAMA_SERVER="$USER_SERVER_BIN"
-    # Re-derive library paths from new binary location
-    _server_dir="$(dirname "$LLAMA_SERVER")"
-    _build_root="${_server_dir%/bin}"
-    _lib_paths="$_server_dir"
-    while IFS= read -r d; do
-        _lib_paths="$_lib_paths:$d"
-    done < <(find "$_build_root" -name '*.so' -printf '%h\n' 2>/dev/null | sort -u)
-    export LD_LIBRARY_PATH="${_lib_paths}:${LD_LIBRARY_PATH:-}"
-    unset _server_dir _build_root _lib_paths
+    # Setup lib hub for the new binary
+    setup_lib_hub "$LLAMA_SERVER"
 fi
 
 if [[ -z "$LLAMA_SERVER" ]]; then
@@ -544,7 +561,8 @@ RUNNING_PID=""
 try_start() {
     local extra_flags=("$@")
     RUNNING_PID=""
-    "$LLAMA_SERVER" "${COMMON_FLAGS[@]}" "${extra_flags[@]}" >"$SERVER_LOG" 2>&1 &
+    # Use tee to show output to user while still capturing to log for health check
+    "$LLAMA_SERVER" "${COMMON_FLAGS[@]}" "${extra_flags[@]}" 2>&1 | tee -a "$SERVER_LOG" &
     local pid=$!
     local i=0
     while (( i < 240 )); do
