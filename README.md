@@ -6,34 +6,19 @@ Smart launcher for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and
 llm-server ~/ai_models/Qwen3.5-397B-A17B-UD-IQ3_XXS.gguf
 ```
 
-That's it. It handles everything: GPU detection, MoE expert placement, KV cache sizing, context reduction, crash recovery.
-
-![demo](demo.gif)
-
 ## Features
 
-- **Auto GPU detection** — works with 0 to 8+ GPUs, any mix of NVIDIA cards
-- **Heterogeneous GPU support** — different VRAM sizes, different PCIe bandwidths, properly weighted
-- **MoE expert auto-placement** — starts conservative, measures actual VRAM usage, optimizes, caches for instant next startup
-- **Smart KV cache** — `--kv-quality high|mid|low` (f16/q8_0/q4_0, default: mid)
-- **Dynamic batch sizing** — scales with available VRAM
-- **Crash recovery** — auto-restarts with backoff on runtime crashes
-- **Config caching** — first run auto-tunes, subsequent runs start instantly
-- **SSM/Mamba hybrid support** — detects and disables incompatible features
-- **GGUF metadata parsing** — reads layer count, expert count, KV heads directly from model file
-- **CPU-only mode** — `--cpu` to force CPU-only inference (when GPUs are busy)
-- **ik_llama.cpp graph split** — auto-detects ik_llama.cpp and uses `--split-mode graph` for multi-GPU (with automatic fallback to layer split if NCCL fails)
-- **Custom binary/lib paths** — `--server-bin` and `--lib-path` flags for custom builds or Docker
-- **Benchmark mode** — `--benchmark` to measure tok/s after startup
-- **Dry-run mode** — `--dry-run` to print the command without executing
+- **Smart Switcher** — Auto-detects fused `ffn_up_gate` tensors and switches to mainline `llama.cpp` to prevent `ik_llama.cpp` crashes.
+- **Lib Hub** — Automatically symlinks all required `.so` libraries into a temporary directory, solving library path issues.
+- **Auto GPU detection** — works with 0 to 8+ GPUs, any mix of NVIDIA cards.
+- **Split Mode Graph** — Automatically enables `-sm graph` for both `ik_llama.cpp` and mainline for superior multi-GPU scaling.
+- **Heterogeneous GPU support** — different VRAM sizes, different PCIe bandwidths, properly weighted.
+- **MoE expert auto-placement** — starts conservative, measures actual VRAM usage, optimizes, caches for instant next startup.
+- **Smart KV cache** — picks q8_0 when there's headroom, falls back to q4_0 when tight.
+- **Crash recovery** — auto-restarts with backoff on runtime crashes.
+- **Benchmark mode** — `--benchmark` to measure tok/s and auto-exit after completion.
 
 ## Install
-
-```bash
-curl -sfL https://raw.githubusercontent.com/mik/llm-server/main/install.sh | bash
-```
-
-Or manually:
 
 ```bash
 git clone https://github.com/raketenkater/llm-server.git
@@ -53,180 +38,27 @@ cp llm-server/llm-server llm-server/llm-server-gui ~/.local/bin/
 # Basic — auto-detects everything
 llm-server model.gguf
 
-# Custom port
-llm-server --port 8082 model.gguf
+# Force a specific backend
+llm-server --server-bin /path/to/llama-server model.gguf
 
-# Custom context size
-llm-server --ctx-size 32768 model.gguf
-
-# Force re-tune (ignore cached config)
-llm-server --retune model.gguf
-
-# Print the command without running it
-llm-server --dry-run model.gguf
-
-# Start and run a quick benchmark
+# Start and run a quick benchmark (auto-exits)
 llm-server --benchmark model.gguf
 
 # Force CPU-only (ignore GPUs)
 llm-server --cpu model.gguf
-
-# KV cache quality: high (f16), mid (q8_0, default), low (q4_0)
-llm-server --kv-quality high model.gguf
-
-# Custom llama-server binary
-llm-server --server-bin /opt/llama/bin/llama-server model.gguf
-
-# Custom library path (useful for Docker or custom builds)
-llm-server --lib-path /usr/local/lib/llama model.gguf
-
-# Model picker TUI
-llm-server-gui
 ```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LLAMA_SERVER` | auto-detect | Path to `llama-server` binary |
-| `LLM_MODEL_DIR` | `~/ai_models` | Default model directory |
-| `LLM_PORT` | `8081` | Server port |
-| `LLM_CTX_SIZE` | `65536` | Context size |
 
 ## How It Works
 
 ### Strategy Selection
-
 The script evaluates your hardware and model, then picks the best strategy:
+- `single_gpu`: Fits entirely in the fastest VRAM.
+- `multi_gpu_dense`: Parallelizes across all GPUs using **Split Mode Graph**.
+- `moe_offload`: Optimized expert placement for `ik_llama.cpp`.
+- `cpu_only`: Fallback for systems without GPUs.
 
-```
-┌─ --cpu flag?
-│  └─ Yes → cpu_only (optimized: --mlock, smaller batches, no GPU flags)
-│
-├─ Model fits on single GPU?
-│  └─ Yes → single_gpu (all layers on fastest GPU)
-│
-├─ Dense model fits across all GPUs?
-│  └─ Yes → multi_gpu_dense (graph split on ik_llama.cpp, row split on mainline)
-│
-├─ MoE model?
-│  └─ Yes → moe_offload (experts on GPU by bandwidth priority, rest on CPU)
-│
-├─ Dense model too big for GPU?
-│  └─ Yes → dense_cpu_offload (layer split with CPU spill)
-│
-└─ No GPUs?
-   └─ cpu_only
-```
-
-### MoE Auto-Tuning
-
-For large MoE models (like Qwen3.5-397B) that don't fit entirely in VRAM:
-
-1. **Conservative start** — places experts on GPUs using safe VRAM budgets
-2. **Measure** — checks actual VRAM usage after loading
-3. **Optimize** — calculates how many more layers fit, adds them (fastest GPU first)
-4. **Fallback** — if optimized config OOMs, backs off by 1 layer and retries
-5. **Cache** — saves the working config for instant startup next time
-
-### GPU Priority
-
-GPUs are sorted by `PCIe_width × PCIe_gen` (effective bandwidth). This means:
-- A x16 Gen3 GPU handles more layers than a x4 Gen3 GPU
-- Tensor splits are weighted by `VRAM × bandwidth` so faster GPUs do more work
-
-### Smart Flag Selection
-
-The script auto-configures based on your hardware:
-
-| Flag | Logic |
-|------|-------|
-| KV cache type | `--kv-quality`: high (f16), mid (q8_0, default), low (q4_0) |
-| Batch size | 8192 with headroom, 4096 if tight, 2048 for offload |
-| Thread count | Physical cores (not hyperthreads) |
-| Context shift | Disabled for SSM/Mamba hybrids (crashes) |
-| Flash attention | Always on |
-| Prompt cache | 10% of free RAM, capped at 16GB |
-
-## Examples
-
-### Single GPU (RTX 3090 24GB)
-
-```
-═══ llm-server v1.0.0 ═══
-GPUs: 1 detected
-  GPU0: NVIDIA GeForce RTX 3090 23456MB free (PCIe x16 gen3)
-
-Model: Qwen3.5-27B-UD-Q4_K_XL.gguf
-Size: 17.2GB
-Architecture: 36 layers, dense
-
-Strategy: single_gpu
-```
-
-### Multi-GPU Heterogeneous (3090 Ti + 4070 + 3060)
-
-```
-═══ llm-server v1.0.0 ═══
-GPUs: 3 detected
-  GPU0: NVIDIA GeForce RTX 3090 Ti 24564MB free (PCIe x16 gen3)
-  GPU2: NVIDIA GeForce RTX 4070 12024MB free (PCIe x4 gen3)
-  GPU1: NVIDIA GeForce RTX 3060 12036MB free (PCIe x1 gen3)
-
-Model: Qwen3.5-397B-A17B-UD-IQ3_XXS.gguf
-Size: 140.2GB
-Architecture: 128 layers, 512 experts (MoE)
-
-Strategy: moe_offload
-Expert placement (conservative):
-  GPU0 (RTX 3090 Ti): 14 layers (blk 0-13)
-  GPU2 (RTX 4070):    4 layers (blk 14-17)
-  GPU1 (RTX 3060):    7 layers (blk 18-24)
-  CPU (RAM): 103 layers (~101970MB)
-
-Optimized placement:
-  GPU0 (RTX 3090 Ti): 18 layers (blk 0-17)
-  GPU2 (RTX 4070):    5 layers (blk 18-22)
-  GPU1 (RTX 3060):    8 layers (blk 23-30)
-  CPU (RAM): 97 layers
-```
-
-## systemd Service
-
-Run as a system service:
-
-```bash
-sudo cp examples/systemd/llm-server.service /etc/systemd/system/llm-server@.service
-# Edit ExecStart path and model
-sudo systemctl enable --now llm-server@yourusername
-```
-
-## Docker
-
-The script works inside Docker containers. Requirements:
-
-```bash
-docker run --gpus all --ipc=host \
-  -v /path/to/models:/models \
-  your-image llm-server /models/model.gguf
-```
-
-- `--gpus all` — exposes NVIDIA GPUs
-- `--ipc=host` — required for NCCL multi-GPU communication (graph split)
-- `lsof` must be installed in the image (used for port cleanup)
-- Use `--server-bin` and `--lib-path` if the binary/libs aren't in the default paths
-
-## Why ik_llama.cpp?
-
-[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) is a fork of llama.cpp optimized for multi-GPU and MoE inference. Key advantages:
-
-- **Expert CPU offload** (`-ot exps=CPU`) — keeps attention on GPU, offloads expert FFN weights to RAM
-- **Merged QKV** (`-mqkv`) — fused attention for faster inference
-- **Fused delta-net** — optimized SSM kernels
-- **Graph split mode** (`--split-mode graph`) — true tensor parallelism across GPUs, significantly faster than layer/row split
-
-`llm-server` auto-detects which backend you have and works with either.
+### The Smart Switcher
+Newer mainline `llama.cpp` quants often "fuse" tensors (e.g., `ffn_up_gate`). While these provide a 10-20% prefill boost in mainline, they cause a hard crash in `ik_llama.cpp`. `llm-server` peeks at the model's metadata and automatically switches to the correct backend.
 
 ## License
-
 MIT

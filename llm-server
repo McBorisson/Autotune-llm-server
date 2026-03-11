@@ -272,7 +272,7 @@ TOTAL_SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_BYTES/1048576}")
 TOTAL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_SIZE_BYTES/1073741824}")
 
 # Read GGUF metadata
-read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM < <(python3 -c "
+read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED < <(python3 -c "
 import struct
 r = {}
 with open('$MODEL_PATH', 'rb') as f:
@@ -304,8 +304,37 @@ with open('$MODEL_PATH', 'rb') as f:
             elif at == 8:
                 for _ in range(al): f.read(struct.unpack('<Q', f.read(8))[0])
         else: break
-print(r.get('layers',0), r.get('experts',0), r.get('hkv',0), r.get('kl',0), r.get('vl',0), r.get('ssm',0))
-" 2>/dev/null || echo "0 0 0 0 0 0")
+    # Check for fused tensors (quick scan of tensor names)
+    r['fused'] = 0
+    try:
+        f.seek(0)
+        f.read(4); f.read(4); f.read(8) # magic, version, kv_count
+        kv_count = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(kv_count):
+            kl = struct.unpack('<Q', f.read(8))[0]; f.read(kl); vt = struct.unpack('<I', f.read(4))[0]
+            if vt == 4: f.read(4)
+            elif vt == 8: f.read(struct.unpack('<Q', f.read(8))[0])
+            elif vt in (5, 6): f.read(4)
+            elif vt == 7: f.read(1)
+            elif vt in (0, 1): f.read(1)
+            elif vt in (2, 3): f.read(2)
+            elif vt == 10: f.read(8)
+            elif vt == 9:
+                at = struct.unpack('<I', f.read(4))[0]; al = struct.unpack('<Q', f.read(8))[0]
+                s = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8}
+                if at in s: f.read(al * s[at])
+                elif at == 8:
+                    for _ in range(al): f.read(struct.unpack('<Q', f.read(8))[0])
+        tensor_count = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(min(tensor_count, 1000)): # Scan first 1000 tensors
+            tl = struct.unpack('<Q', f.read(8))[0]
+            tname = f.read(tl).decode('utf-8', errors='replace')
+            if 'ffn_up_gate' in tname: r['fused'] = 1; break
+            n_dims = struct.unpack('<I', f.read(4))[0]
+            f.read(n_dims * 8 + 4 + 8)
+    except: pass
+print(r.get('layers',0), r.get('experts',0), r.get('hkv',0), r.get('kl',0), r.get('vl',0), r.get('ssm',0), r.get('fused',0))
+" 2>/dev/null || echo "0 0 0 0 0 0 0")
 
 LAYER_COUNT=${LAYER_COUNT:-0}
 EXPERT_COUNT=${EXPERT_COUNT:-0}
@@ -313,6 +342,7 @@ HEAD_COUNT_KV=${HEAD_COUNT_KV:-0}
 KEY_LENGTH=${KEY_LENGTH:-0}
 VALUE_LENGTH=${VALUE_LENGTH:-0}
 HAS_SSM=${HAS_SSM:-0}
+HAS_FUSED=${HAS_FUSED:-0}
 
 [[ "$LAYER_COUNT" == "0" ]] && LAYER_COUNT=48 && echo "Warning: Could not detect layer count, using default (48)"
 
@@ -322,7 +352,28 @@ IS_MOE=0
 echo ""
 echo "Model: $MODEL_NAME"
 echo "Size: ${TOTAL_SIZE_GB}GB (${TOTAL_SIZE_MB}MB)"
-echo "Architecture: ${LAYER_COUNT} layers, $([ "$IS_MOE" = "1" ] && echo "${EXPERT_COUNT} experts (MoE)" || echo "dense")"
+echo "Architecture: ${LAYER_COUNT} layers, $([ "$IS_MOE" = "1" ] && echo "${EXPERT_COUNT} experts (MoE)" || echo "dense")$([ "$HAS_FUSED" = "1" ] && echo ", fused up|gate")"
+
+# ── Smart Switcher: Handle fused quants vs backend compatibility ──
+if (( HAS_FUSED == 1 )); then
+    if (( IS_IK_LLAMA == 1 )) && [[ -z "$USER_SERVER_BIN" ]]; then
+        # If we auto-detected ik_llama but model is fused, try switching to mainline
+        MAINLINE_FALLBACK="$HOME/llama.cpp/build/bin/llama-server"
+        if [[ -x "$MAINLINE_FALLBACK" ]]; then
+            echo "Warning: Fused model detected. Switching to mainline llama.cpp to prevent ik_llama.cpp crash."
+            LLAMA_SERVER="$MAINLINE_FALLBACK"
+            IS_IK_LLAMA=0
+            setup_lib_hub "$LLAMA_SERVER"
+        else
+            echo "CRITICAL WARNING: This model uses fused tensors (ffn_up_gate) which are currently BROKEN on ik_llama.cpp."
+            echo "Attempting to run anyway, but a crash is likely. Install mainline llama.cpp for this model."
+        fi
+    elif (( IS_IK_LLAMA == 1 )); then
+        # User explicitly provided ik_llama binary via flag
+        echo "CRITICAL WARNING: Fused model detected. ik_llama.cpp will likely crash."
+        echo "If it fails, use --server-bin to point to a mainline llama.cpp build."
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════
 # Section 4: Smart Flag Builder
@@ -446,12 +497,9 @@ COMMON_FLAGS=(
     # Batch sizes (dynamic)
     -b "$BATCH"
     -ub "$UBATCH"
-    # Tensor optimization
-    --run-time-repack
     # KV cache (dynamic type)
     --cache-type-k "$KV_TYPE"
     --cache-type-v "$KV_TYPE"
-    --defrag-thold 0.1
     # Server
     --jinja
     --threads "$THREADS_GEN"
@@ -459,20 +507,34 @@ COMMON_FLAGS=(
 )
 
 # Conditional flags
-[[ -n "$KHAD_FLAG" ]] && COMMON_FLAGS+=("$KHAD_FLAG")
-[[ -n "$CONTEXT_SHIFT_FLAG" ]] && COMMON_FLAGS+=("$CONTEXT_SHIFT_FLAG")
-(( CRAM_MB > 0 )) && COMMON_FLAGS+=(-cram "$CRAM_MB")
-
-# MoE-specific optimizations
-if (( IS_MOE == 1 )); then
-    COMMON_FLAGS+=(-muge)           # merge up/gate expert tensors
-    COMMON_FLAGS+=(-ger)            # grouped expert routing
-    echo "  MoE model → -muge -ger enabled"
+if [[ "$IS_IK_LLAMA" == "1" ]]; then
+    COMMON_FLAGS+=(--run-time-repack)
+    [[ -n "$KHAD_FLAG" ]] && COMMON_FLAGS+=("$KHAD_FLAG")
+    [[ -n "$CONTEXT_SHIFT_FLAG" ]] && COMMON_FLAGS+=("$CONTEXT_SHIFT_FLAG")
+    (( CRAM_MB > 0 )) && COMMON_FLAGS+=(-cram "$CRAM_MB")
+    COMMON_FLAGS+=(--defrag-thold 0.1)
+    
+    # MoE-specific optimizations
+    if (( IS_MOE == 1 )); then
+        COMMON_FLAGS+=(-muge)           # merge up/gate expert tensors
+        COMMON_FLAGS+=(-ger)            # grouped expert routing
+        echo "  MoE model → -muge -ger enabled"
+    fi
+    
+    if (( GPU_COUNT > 0 )); then
+        COMMON_FLAGS+=(-mqkv)
+    fi
+else
+    # Mainline-specific or compatible flags
+    [[ -n "$CONTEXT_SHIFT_FLAG" ]] && COMMON_FLAGS+=("$CONTEXT_SHIFT_FLAG")
 fi
 
-# GPU flags (split mode is added per-strategy, not here)
+# GPU offloading
 if (( GPU_COUNT > 0 )); then
-    COMMON_FLAGS+=(-ngl 999 -mqkv)  # mqkv auto-disabled by ik_llama when using graph split
+    COMMON_FLAGS+=(-ngl 999)
+    if (( GPU_COUNT > 1 && IS_IK_LLAMA == 1 )); then
+        COMMON_FLAGS+=(-mg "${GPU_INDEX[${GPU_ORDER[0]}]}")
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -631,20 +693,24 @@ run_benchmark() {
     timings=$(curl -sf "$url/slots" 2>/dev/null)
     if [[ -n "$timings" ]]; then
         local pp_rate tg_rate
+        # Improved extraction from slot timings
         pp_rate=$(echo "$timings" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 s=d[0] if isinstance(d,list) else d
-print(f\"{s.get('t_prompt_processing',0)/max(s.get('n_prompt_tokens_processed',1),1)*1000:.1f}\")
+t_pp = s.get('t_prompt_processing', 0)
+n_pp = s.get('n_prompt_tokens_processed', 1)
+if t_pp > 0: print(f\"{n_pp / (t_pp / 1000):.1f}\")
+else: print('?')
 " 2>/dev/null)
         tg_rate=$(echo "$timings" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 s=d[0] if isinstance(d,list) else d
-pp=s.get('n_prompt_tokens_processed',0)
-gen=s.get('n_decoded',0)
-t_gen=s.get('t_token_generation',1)
-print(f'{gen/max(t_gen,1)*1000:.1f}')
+t_gen = s.get('t_token_generation', 0)
+n_gen = s.get('n_decoded', 1)
+if t_gen > 0: print(f\"{n_gen / (t_gen / 1000):.1f}\")
+else: print('?')
 " 2>/dev/null)
         echo "  Prompt processing: ${pp_tokens:-?} tokens @ ${pp_rate:-?} tok/s"
         echo "  Generation:        ${tg_tokens:-?} tokens @ ${tg_rate:-?} tok/s"
@@ -654,6 +720,10 @@ print(f'{gen/max(t_gen,1)*1000:.1f}')
         echo "  (Install ik_llama.cpp for detailed timing)"
     fi
     echo ""
+    # Auto-exit after benchmark to prevent "hanging"
+    echo "Benchmark complete. Shutting down server..."
+    kill_server ""
+    exit 0
 }
 
 # Suggest alternatives when model doesn't fit
@@ -821,8 +891,11 @@ case "$STRATEGY" in
             TS="${TS:+$TS,}$w"
         done
         echo "Tensor split: $TS"
+        
+        # Prefer graph split for both backends if more than 1 GPU
+        GRAPH_EXTRA=(--split-mode graph --tensor-split "$TS")
+        
         if (( IS_IK_LLAMA )); then
-            GRAPH_EXTRA=(--split-mode graph --tensor-split "$TS")
             LAYER_EXTRA=(--split-mode layer --tensor-split "$TS")
             if (( DRY_RUN )); then
                 print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
@@ -849,43 +922,37 @@ case "$STRATEGY" in
                 fi
             fi
         else
-            # Row split parallelizes matmuls across GPUs (faster than layer split for dense models)
-            LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --split-mode row --tensor-split "$TS")
+            # Mainline llama.cpp
             if (( DRY_RUN )); then
-                print_cmd "${LAUNCH_FLAGS[@]}"
+                print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
                 exit 0
             fi
-            run_with_restart "${LAUNCH_FLAGS[@]}"
+            # Test if mainline supports graph mode
+            if timeout 5 "$LLAMA_SERVER" --help 2>&1 | grep -q "graph" 2>/dev/null; then
+                echo "Mainline supports graph mode — attempting launch..."
+                run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+            else
+                # Fallback to row split (classic mainline multi-GPU)
+                LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --split-mode row --tensor-split "$TS")
+                run_with_restart "${LAUNCH_FLAGS[@]}"
+            fi
         fi
         ;;
 
     dense_cpu_offload)
         echo "Dense model with CPU offload"
-        if (( IS_IK_LLAMA && GPU_COUNT > 1 )); then
+        if (( GPU_COUNT > 1 )); then
             GRAPH_EXTRA=(--split-mode graph --no-mmap)
-            LAYER_EXTRA=(--no-mmap)
-            if (( DRY_RUN )); then
-                print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
-                exit 0
-            fi
-            echo "Trying graph split (fastest)..."
-            if try_start "${GRAPH_EXTRA[@]}"; then
-                echo "  Graph split works — restarting with crash recovery..."
-                kill_server "$RUNNING_PID"
+            if (( IS_IK_LLAMA )); then
+                # (ik_llama specific graph logic already handled above or can be simplified here)
+                if (( DRY_RUN )); then print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"; exit 0; fi
                 run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
             else
-                echo "  Graph split failed — retrying with NCCL_P2P_DISABLE=1..."
-                kill_server ""
-                export NCCL_P2P_DISABLE=1
-                if try_start "${GRAPH_EXTRA[@]}"; then
-                    echo "  Graph split works with P2P disabled — restarting with crash recovery..."
-                    kill_server "$RUNNING_PID"
+                # Mainline
+                if timeout 5 "$LLAMA_SERVER" --help 2>&1 | grep -q "graph" 2>/dev/null; then
                     run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
                 else
-                    echo "  Graph split unavailable — falling back to layer split"
-                    kill_server ""
-                    unset NCCL_P2P_DISABLE
-                    run_with_restart "${COMMON_FLAGS[@]}" "${LAYER_EXTRA[@]}"
+                    run_with_restart "${COMMON_FLAGS[@]}" --no-mmap
                 fi
             fi
         else
