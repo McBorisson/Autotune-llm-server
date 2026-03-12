@@ -72,5 +72,6 @@ fi
 
 echo ""
 echo "Done! You can now run:"
-echo "  llm-server <model.gguf>"
-echo "  llm-server <repo/name> --download"
+echo "  llm-server <model.gguf>      # Smart Launcher"
+echo "  llm-server-gui               # Model Selector (TUI)"
+echo "  llm-server <repo> --download # Smart Downloader"
