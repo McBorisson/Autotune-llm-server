@@ -142,9 +142,9 @@ fi
 if (( DOWNLOAD )); then
     TOTAL_VRAM_MB=0
     if command -v nvidia-smi >/dev/null 2>&1; then
-        TOTAL_VRAM_MB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | awk "{s+=$1} END {print s}")
+        TOTAL_VRAM_MB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | awk '{s+=$1} END {print s}')
     fi
-    RAM_AVAIL_MB=$(grep MemAvailable /proc/meminfo | awk "{print int($2/1024)}")
+    RAM_AVAIL_MB=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
     # Try finding the downloader in several places
     DOWNLOADER="/home/mik/ai_models/download_any_gguf.py"
     if [[ ! -f "$DOWNLOADER" ]]; then
