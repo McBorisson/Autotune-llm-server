@@ -5,6 +5,8 @@
 # Works on any system: 0-8+ GPUs, any VRAM/RAM configuration.
 #
 # Usage:
+#   llm-server <repo/name> --download    # Download from HuggingFace
+#   llm-server -h                        # Show this help message
 #   llm-server <model.gguf>              # Launch with auto-tuning
 #   llm-server <model.gguf> --retune     # Force re-optimization
 #   llm-server <model.gguf> --dry-run    # Print command without executing
@@ -32,11 +34,14 @@ PORT="${LLM_PORT:-8081}"
 HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
+# Ensure model directory exists
+mkdir -p "$MODEL_DIR"
 CACHE_DIR="$HOME/.cache/llm-server"
 SERVER_LOG="/tmp/llm-server.log"
 LIB_HUB_DIR=""
 
 RETUNE=0
+DOWNLOAD=0
 DRY_RUN=0
 VERBOSE=0
 BENCHMARK=0
@@ -118,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --server-bin)  USER_SERVER_BIN="$2"; shift 2 ;;
         --lib-path)    USER_LIB_PATH="$2"; shift 2 ;;
         --kv-quality)  KV_QUALITY="$2"; shift 2 ;;
+        --download)  DOWNLOAD=1; shift ;;
         --version)     echo "llm-server v$VERSION"; exit 0 ;;
         --help|-h)
             sed -n '2,/^$/s/^# \?//p' "$0"
@@ -128,8 +134,47 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$MODEL_ARG" ]]; then
-    echo "Error: No model specified. Usage: llm-server <model.gguf>"
+    echo "Error: No model specified. Usage: llm-server <model.gguf> or <repo/name> --download"
     exit 1
+fi
+
+# ── Download Logic ──
+if (( DOWNLOAD )); then
+    TOTAL_VRAM_MB=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        TOTAL_VRAM_MB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | awk "{s+=$1} END {print s}")
+    fi
+    RAM_AVAIL_MB=$(grep MemAvailable /proc/meminfo | awk "{print int($2/1024)}")
+    # Try finding the downloader in several places
+    DOWNLOADER="/home/mik/ai_models/download_any_gguf.py"
+    if [[ ! -f "$DOWNLOADER" ]]; then
+        DOWNLOADER="$(dirname "$(readlink -f "$0")")/download_any_gguf.py"
+    fi
+    
+    if [[ ! -f "$DOWNLOADER" ]]; then
+        echo "Error: Downloader script (download_any_gguf.py) not found."
+        echo "Please ensure it exists in /home/mik/ai_models/ or the script directory."
+        exit 1
+    fi
+
+    echo "Launching GGUF Downloader for: $MODEL_ARG"
+    echo "Wait for the interactive session..."
+    echo ""
+    
+    # We run it with the repo name if it looks like one
+    if [[ "$MODEL_ARG" == */* ]]; then
+        # If it's a repo name, we'll try to automate it slightly by passing it
+        # Note: The current python script is interactive, so we just run it.
+        # User hints: The script might need hf_hub_download to be installed.
+        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
+    else
+        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
+    fi
+    
+    echo ""
+    echo "Download step complete."
+    echo "To launch your new model, run: llm-server <path_to_downloaded_file>"
+    exit 0
 fi
 
 if [[ ! -f "$MODEL_ARG" ]]; then

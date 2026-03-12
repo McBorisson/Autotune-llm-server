@@ -6,10 +6,12 @@
 # Usage:
 #   llm-server-gui                    # Select from ~/ai_models
 #   llm-server-gui --model-dir /path  # Custom model directory
-
+#   llm-server-gui --model /path/to/model.gguf  # Launch specific model directly
+#
 set -euo pipefail
 
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
+SPECIFIC_MODEL=""
 LAUNCHER="$(dirname "$0")/llm-server"
 
 # Parse args (pass through to llm-server)
@@ -17,9 +19,19 @@ PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model-dir) MODEL_DIR="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --model) SPECIFIC_MODEL="$2"; shift 2 ;;
         *)           PASSTHROUGH_ARGS+=("$1"); shift ;;
     esac
 done
+
+# If a specific model is provided, launch directly without TUI
+if [[ -n "$SPECIFIC_MODEL" ]]; then
+    if [[ ! -f "$SPECIFIC_MODEL" ]]; then
+        echo "Error: Model not found: $SPECIFIC_MODEL"
+        exit 1
+    fi
+    exec "$LAUNCHER" "${PASSTHROUGH_ARGS[@]}" "$SPECIFIC_MODEL"
+fi
 
 if [[ ! -d "$MODEL_DIR" ]]; then
     echo "Error: Model directory not found: $MODEL_DIR"
