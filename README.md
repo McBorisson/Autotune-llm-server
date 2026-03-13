@@ -10,13 +10,14 @@ llm-server unsloth/Qwen3.5-27B-GGUF --download
 
 ## Features
 
-- **Smart Setup** — No manual configuration needed. Creates model directories automatically on first run.
 - **Built-in GGUF Downloader** — Use `--download` with any HuggingFace repo. Automatically recommends the best quantization based on your total VRAM and System RAM.
-- **Smart Switcher** — Auto-detects fused `ffn_up_gate` tensors and switches to mainline `llama.cpp` to prevent `ik_llama.cpp` crashes.
+- **Native Fused Support** — Full compatibility with fused `ffn_up_gate` models (e.g., AesSedai) using high-performance `ik_llama.cpp` kernels.
 - **Lib Hub** — Automatically symlinks all required `.so` libraries into a temporary directory, solving library path issues.
+- **Auto GPU detection** — works with 0 to 8+ GPUs, any mix of NVIDIA cards.
 - **Split Mode Graph** — Automatically enables `-sm graph` for both `ik_llama.cpp` and mainline for superior multi-GPU scaling.
 - **Heterogeneous GPU support** — different VRAM sizes, different PCIe bandwidths, properly weighted.
 - **MoE expert auto-placement** — starts conservative, measures actual VRAM usage, optimizes, caches for instant next startup.
+- **Crash recovery** — auto-restarts with backoff on runtime crashes.
 - **Benchmark mode** — `--benchmark` to measure tok/s and auto-exit after completion.
 
 ## Install
@@ -41,9 +42,6 @@ cd llm-server
 # Basic — auto-detects everything
 llm-server model.gguf
 
-# Help — show all available flags
-llm-server -h
-
 # Interactive Download & Recommend — specify any HuggingFace repository
 llm-server unsloth/Qwen3.5-27B-GGUF --download
 
@@ -61,8 +59,14 @@ When you use `--download`, the script calculates your total available memory:
 `Total = System VRAM + System RAM`
 It then looks at the model repository and recommends the quantization level that will give you the best balance of speed and quality for your specific hardware.
 
-### The Lib Hub
-Fixes the "missing library" issue by dynamically finding all `.so` files in your build directory and linking them into a temporary search path. This ensures `llama-server` always has its helper libraries, even in complex or custom build environments.
+### Native Fused Support
+Modern GGUF quants often "fuse" tensors (e.g., `ffn_up_gate`) for 10-20% faster processing. While these previously caused crashes on specialized backends, `llm-server` now detects these models and enables the optimized fused kernels in `ik_llama.cpp` automatically.
+
+## Support the Project
+
+If this tool saved you from flag-tuning hell, consider supporting the development!
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/raketenkater)
 
 ## License
 MIT
