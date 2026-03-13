@@ -62,11 +62,5 @@ It then looks at the model repository and recommends the quantization level that
 ### Native Fused Support
 Modern GGUF quants often "fuse" tensors (e.g., `ffn_up_gate`) for 10-20% faster processing. While these previously caused crashes on specialized backends, `llm-server` now detects these models and enables the optimized fused kernels in `ik_llama.cpp` automatically.
 
-## Support the Project
-
-If this tool saved you from flag-tuning hell, consider supporting the development!
-
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/raketenkater)
-
 ## License
 MIT
