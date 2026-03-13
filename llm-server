@@ -434,7 +434,21 @@ for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
     (( GPU_VRAM_FREE[$i] > BEST_GPU_VRAM )) && BEST_GPU_VRAM=${GPU_VRAM_FREE[$i]}
 done
 
-# (Memory Safety Check disabled by user request — YOLO mode enabled)
+# ── Memory Analysis (Informational) ──
+TOTAL_MEM_MB=$(( TOTAL_VRAM_MB + RAM_AVAIL_MB ))
+# Estimate KV cache based on ctx size and model layers (rough proxy for memory overhead)
+KV_EST_MB=$(( CTX_SIZE * LAYER_COUNT / 1024 )) 
+ESTIMATED_TOTAL_NEEDED=$(( TOTAL_SIZE_MB + KV_EST_MB + 5120 )) # Model + KV + 5GB system headroom
+
+if (( TOTAL_SIZE_MB > TOTAL_MEM_MB )); then
+    echo "⚠️  WARNING: Model (${TOTAL_SIZE_GB}GB) is larger than your total available memory (${TOTAL_MEM_MB}MB)."
+    echo "   A system crash or heavy swapping is likely. Proceeding anyway..."
+elif (( ESTIMATED_TOTAL_NEEDED > TOTAL_MEM_MB )); then
+    echo "ℹ️  INFO: Model + KV Cache (~${ESTIMATED_TOTAL_NEEDED}MB) is very close to your total memory (${TOTAL_MEM_MB}MB)."
+    echo "   Expect potential instability or slow performance if memory fills up."
+else
+    echo "✓ Memory: Model and context estimated to fit within available RAM/VRAM."
+fi
 
 FITS_ON_GPU=0
 (( TOTAL_SIZE_MB * 130 / 100 <= TOTAL_VRAM_MB )) && FITS_ON_GPU=1
