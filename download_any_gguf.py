@@ -352,6 +352,19 @@ def select_quantization(repo, vram_mb=0, ram_mb=0):
     """Let user select quantization"""
     print("\n🔍 Scanning repository for available quantizations...")
 
+    try:
+        files = list_repo_files(repo)
+        has_safetensors = any(f.endswith(".safetensors") for f in files)
+        has_ggufs = any(f.endswith(".gguf") for f in files)
+        
+        if has_safetensors and not has_ggufs:
+            print(f"\n⚠️  NOTICE: This repository contains Safetensors, not GGUF files.")
+            print(f"   Inference via llama.cpp/ik_llama requires GGUF format.")
+            print(f"   Search suggestion: {repo}-GGUF")
+            return None
+    except:
+        pass
+
     quantizations = list_available_quantizations(repo)
 
     if not quantizations:

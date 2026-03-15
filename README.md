@@ -2,6 +2,8 @@
 
 Smart launcher for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and [llama.cpp](https://github.com/ggml-org/llama.cpp). Auto-detects your hardware, figures out the optimal configuration, and launches the server — no manual flag tuning required.
 
+**Supports Linux (NVIDIA CUDA), macOS (Apple Silicon Metal), and Windows (via WSL2).**
+
 ```bash
 llm-server unsloth/Qwen3.5-27B-GGUF --download
 ```
@@ -30,11 +32,19 @@ cd llm-server
 
 ### Requirements
 
+**Linux:**
 - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (recommended) or [llama.cpp](https://github.com/ggml-org/llama.cpp) built with CUDA
 - `nvidia-smi` (for GPU detection)
-- `python3` (for GGUF metadata parsing and downloading)
-- `huggingface_hub` and `tqdm` (required for `--download` feature)
-- `curl` (for health checks and benchmarks)
+- `python3`, `huggingface_hub`, `tqdm`, `curl`
+
+**macOS (Apple Silicon):**
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) built with Metal (or `brew install llama.cpp`)
+- `python3`, `huggingface_hub`, `tqdm`, `curl`
+
+**Windows:**
+- Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) (`wsl --install` in PowerShell)
+- Inside WSL2, follow the Linux instructions above
+- NVIDIA GPU passthrough works automatically in WSL2 with up-to-date drivers
 
 ## Usage
 
@@ -58,8 +68,6 @@ llm-server --benchmark model.gguf
 When you use `--download`, the script calculates your total available memory:
 `Total = System VRAM + System RAM`
 It then looks at the model repository and recommends the quantization level that will give you the best balance of speed and quality for your specific hardware.
-
-![download-demo](download-demo.gif)
 
 ### Native Fused Support
 Modern GGUF quants often "fuse" tensors (e.g., `ffn_up_gate`) for 10-20% faster processing. While these previously caused crashes on specialized backends, `llm-server` now detects these models and enables the optimized fused kernels in `ik_llama.cpp` automatically.

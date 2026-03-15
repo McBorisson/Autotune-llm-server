@@ -393,7 +393,7 @@ def read_tensors(f, tensor_count):
     for _ in range(tensor_count):
         tl = struct.unpack('<Q', f.read(8))[0]
         tname = f.read(tl).decode('utf-8', errors='replace')
-        if 'ffn_up_gate' in tname: r['fused'] = 1
+        if 'ffn_up_gate' in tname or 'ffn_gate_up' in tname: r['fused'] = 1
         n_dims = struct.unpack('<I', f.read(4))[0]
         dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
         ttype = struct.unpack('<I', f.read(4))[0]
@@ -697,8 +697,9 @@ echo "Strategy: $STRATEGY"
 # Args: pairs of "CUDA_INDEX LAYER_START LAYER_COUNT" followed by end marker
 build_ot_string() {
     local parts=()
-    # Support both fused (up_gate) and unfused (gate|up|down) expert tensor names
-    local expert_pattern="ffn_(gate|up|down|up_gate)_exps"
+    # Support both fused (gate_up/up_gate) and unfused (gate|up|down) expert tensor names
+    # Longer alternatives first so regex engine matches them before shorter prefixes
+    local expert_pattern="ffn_(gate_up|up_gate|gate|up|down)_exps"
 
     while [[ $# -ge 3 ]]; do
         local cuda_idx=$1 layer_start=$2 layer_count=$3
@@ -1165,18 +1166,24 @@ BUDGET_PCTS=(70 55 50 45 40 35 30 25)  # Decreasing budget for lower-priority GP
 NEXT_LAYER=0
 TOTAL_GPU_LAYERS=0
 
-# Per-GPU VRAM budget: subtract proportional KV cache + compute overhead per layer
-# KV cache is split across GPUs proportionally to layers placed on each
-# Formula: each layer on a GPU costs EXPERT_PER_LAYER_MB + KV_PER_LAYER_MB + compute
+# Per-GPU VRAM budget: each layer on a GPU costs expert + non-expert + KV
+# With -ngl 999, non-expert tensors (attention, norms) also go to GPUs
+# Primary GPU (-mg 0) also gets global tensors (embeddings, output head)
 KV_PER_LAYER_MB=$(( KV_TOTAL_MB / LAYER_COUNT ))
+NON_EXPERT_RAM_MB=${NON_EXPERT_TOTAL_MB:-$(( TOTAL_SIZE_MB - EXPERT_TOTAL_MB ))}
+NON_EXPERT_PER_LAYER_MB=$(( NON_EXPERT_RAM_MB / LAYER_COUNT ))
 COMPUTE_PER_GPU_MB=512  # compute buffers + CUDA context per GPU
-COST_PER_LAYER_MB=$(( EXPERT_PER_LAYER_MB + KV_PER_LAYER_MB ))
-echo "  Per-layer cost: ${EXPERT_PER_LAYER_MB}MB experts + ${KV_PER_LAYER_MB}MB KV = ${COST_PER_LAYER_MB}MB"
+MAIN_GPU_EXTRA_MB=2048  # embeddings + output head on primary GPU (-mg 0)
+COST_PER_LAYER_MB=$(( EXPERT_PER_LAYER_MB + KV_PER_LAYER_MB + NON_EXPERT_PER_LAYER_MB ))
+echo "  Per-layer cost: ${EXPERT_PER_LAYER_MB}MB experts + ${NON_EXPERT_PER_LAYER_MB}MB attn/norm + ${KV_PER_LAYER_MB}MB KV = ${COST_PER_LAYER_MB}MB"
 
 for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
     gi=${GPU_ORDER[$i]}
     pct=${BUDGET_PCTS[$i]:-20}
-    available_mb=$(( GPU_VRAM_FREE[$gi] - COMPUTE_PER_GPU_MB ))
+    # Primary GPU needs extra headroom for global tensors (embeddings, output)
+    local_overhead=$COMPUTE_PER_GPU_MB
+    (( i == 0 )) && local_overhead=$(( COMPUTE_PER_GPU_MB + MAIN_GPU_EXTRA_MB ))
+    available_mb=$(( GPU_VRAM_FREE[$gi] - local_overhead ))
     (( available_mb < 0 )) && available_mb=0
     budget_mb=$(( available_mb * pct / 100 ))
     layers=0
@@ -1194,14 +1201,14 @@ done
 LAYERS_CPU=$(( LAYER_COUNT - TOTAL_GPU_LAYERS ))
 
 # RAM safety check
-if (( HEAD_COUNT_KV > 0 && KEY_LENGTH > 0 && VALUE_LENGTH > 0 )); then
-    KV_CACHE_MB=$(awk "BEGIN {printf \"%.0f\", $CTX_SIZE * $LAYER_COUNT * $HEAD_COUNT_KV * ($KEY_LENGTH + $VALUE_LENGTH) * 0.5 / 1048576}")
-else
-    KV_CACHE_MB=$(( LAYER_COUNT * 70 ))
-fi
-RAM_OVERHEAD_MB=2048  # OS + llama-server process overhead
+# With -ngl 999: non-expert tensors (attention, norms, embeddings) go to GPUs, not RAM
+# Only expert tensors for CPU layers stay in RAM
+# CUDA_Host pinned memory ~1GB for output + compute buffers
 CPU_EXPERT_MB=$(( LAYERS_CPU * EXPERT_PER_LAYER_MB ))
-RAM_NEEDED=$(( CPU_EXPERT_MB + KV_CACHE_MB + RAM_OVERHEAD_MB ))
+# 15% padding covers alignment, tensor metadata, graph structures, mmap overhead
+TENSOR_RAM_PADDED=$(( CPU_EXPERT_MB * 115 / 100 ))
+CUDA_HOST_MB=1024   # pinned memory for output + compute transfers
+RAM_NEEDED=$(( TENSOR_RAM_PADDED + CUDA_HOST_MB ))
 
 ACTUAL_CTX=$CTX_SIZE
 
@@ -1219,7 +1226,9 @@ if (( RAM_NEEDED > RAM_AVAIL_MB && LAYERS_CPU > 0 && GPU_COUNT > 0 )); then
             gi=${GPU_ORDER[$i]}
             pct=$(( bump - i * 5 ))
             (( pct < 30 )) && pct=30
-            available_mb=$(( GPU_VRAM_FREE[$gi] - COMPUTE_PER_GPU_MB ))
+            local_overhead=$COMPUTE_PER_GPU_MB
+            (( i == 0 )) && local_overhead=$(( COMPUTE_PER_GPU_MB + MAIN_GPU_EXTRA_MB ))
+            available_mb=$(( GPU_VRAM_FREE[$gi] - local_overhead ))
             (( available_mb < 0 )) && available_mb=0
             budget_mb=$(( available_mb * pct / 100 ))
             layers=0
@@ -1234,7 +1243,8 @@ if (( RAM_NEEDED > RAM_AVAIL_MB && LAYERS_CPU > 0 && GPU_COUNT > 0 )); then
         done
         LAYERS_CPU=$(( LAYER_COUNT - TOTAL_GPU_LAYERS ))
         CPU_EXPERT_MB=$(( LAYERS_CPU * EXPERT_PER_LAYER_MB ))
-        RAM_NEEDED=$(( CPU_EXPERT_MB + KV_CACHE_MB + RAM_OVERHEAD_MB ))
+        TENSOR_RAM_PADDED=$(( CPU_EXPERT_MB * 115 / 100 ))
+        RAM_NEEDED=$(( TENSOR_RAM_PADDED + CUDA_HOST_MB ))
         if (( RAM_NEEDED <= RAM_AVAIL_MB )); then
             echo "  Adjusted GPU budget to ${bump}% — ${LAYERS_CPU} CPU layers (${RAM_NEEDED}MB RAM)"
             break
@@ -1242,22 +1252,12 @@ if (( RAM_NEEDED > RAM_AVAIL_MB && LAYERS_CPU > 0 && GPU_COUNT > 0 )); then
     done
 fi
 
-# Phase 2: If still over RAM, reduce context size
+# Phase 2: If still over RAM after maxing GPU budgets, warn and proceed
+# KV cache lives on GPUs so reducing context doesn't help RAM
 if (( RAM_NEEDED > RAM_AVAIL_MB )); then
-    for try_ctx in 32768 16384 8192 4096; do
-        kv_at_ctx=$(( KV_CACHE_MB * try_ctx / CTX_SIZE ))
-        needed=$(( CPU_EXPERT_MB + kv_at_ctx + RAM_OVERHEAD_MB ))
-        if (( needed <= RAM_AVAIL_MB )); then
-            echo "WARNING: Reducing context from $CTX_SIZE to $try_ctx to fit in RAM"
-            ACTUAL_CTX=$try_ctx
-            KV_CACHE_MB=$kv_at_ctx
-            RAM_NEEDED=$needed
-            for idx in "${!COMMON_FLAGS[@]}"; do
-                [[ "${COMMON_FLAGS[$idx]}" == "--ctx-size" ]] && COMMON_FLAGS[$((idx+1))]="$ACTUAL_CTX"
-            done
-            break
-        fi
-    done
+    echo "WARNING: Model needs ~${RAM_NEEDED}MB RAM but only ${RAM_AVAIL_MB}MB available"
+    echo "  The auto-tuner will adjust after first run. If the server crashes,"
+    echo "  consider closing other applications or adding more system RAM."
 fi
 
 # Build -ot string

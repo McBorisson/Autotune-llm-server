@@ -15,8 +15,19 @@ echo "═══ llm-server Installer ═══"
 echo "Target directory: $INSTALL_DIR"
 echo ""
 
-# List of files to copy from current directory to INSTALL_DIR
-FILES=("llm-server" "llm-server-gui")
+# Detect platform and select appropriate files
+OS="$(uname -s)"
+case "$OS" in
+    Darwin)
+        FILES=("llm-server-mac" "llm-server-gui")
+        # On macOS, also create a 'llm-server' symlink pointing to the mac version
+        SYMLINK_MAC=1
+        ;;
+    *)
+        FILES=("llm-server" "llm-server-gui")
+        SYMLINK_MAC=0
+        ;;
+esac
 
 for f in "${FILES[@]}"; do
     if [[ -f "$f" ]]; then
@@ -28,11 +39,16 @@ for f in "${FILES[@]}"; do
     fi
 done
 
-# Install the downloader to the model dir (where llm-server looks for it)
-if [[ -f "/home/mik/ai_models/download_any_gguf.py" ]]; then
+# On macOS, symlink llm-server → llm-server-mac so both names work
+if (( SYMLINK_MAC )) && [[ -f "$INSTALL_DIR/llm-server-mac" ]]; then
+    ln -sf "$INSTALL_DIR/llm-server-mac" "$INSTALL_DIR/llm-server"
+    echo "  ✓ Symlinked llm-server → llm-server-mac"
+fi
+
+# Install the downloader to the model dir
+if [[ -f "$MODEL_DIR/download_any_gguf.py" ]]; then
     echo "  ✓ Downloader already exists in $MODEL_DIR"
 else
-    # Try to find it in the repo
     if [[ -f "download_any_gguf.py" ]]; then
         cp "download_any_gguf.py" "$MODEL_DIR/download_any_gguf.py"
         echo "  ✓ Installed download_any_gguf.py to $MODEL_DIR"
@@ -55,18 +71,28 @@ else
     echo "  ⚠ Error: python3 not found. Downloader will not work."
 fi
 
-# Check for nvidia-smi
-if command -v nvidia-smi >/dev/null 2>&1; then
-    echo "  ✓ nvidia-smi found (GPU acceleration enabled)"
+# Check for GPU acceleration
+if [[ "$OS" == "Darwin" ]]; then
+    if system_profiler SPDisplaysDataType 2>/dev/null | grep -qi "Metal\|Apple"; then
+        echo "  ✓ Apple Metal GPU detected"
+    else
+        echo "  ⚠ Warning: No Metal GPU detected. Will run CPU-only."
+    fi
 else
-    echo "  ⚠ Warning: nvidia-smi not found. Script will fallback to CPU-only if no GPUs detected."
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "  ✓ nvidia-smi found (GPU acceleration enabled)"
+    else
+        echo "  ⚠ Warning: nvidia-smi not found. Script will fallback to CPU-only if no GPUs detected."
+    fi
 fi
 
 # Check PATH
+SHELL_RC="~/.bashrc"
+[[ "$OS" == "Darwin" ]] && SHELL_RC="~/.zshrc"
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
     echo ""
     echo "  ⚠ WARNING: $INSTALL_DIR is not in your PATH."
-    echo "    Add this to your ~/.bashrc:"
+    echo "    Add this to your $SHELL_RC:"
     echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
