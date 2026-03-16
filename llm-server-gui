@@ -23,7 +23,15 @@ mkdir -p "$CONFIG_DIR"
 
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 SPECIFIC_MODEL=""
-LAUNCHER="$(dirname "$0")/llm-server"
+# Auto-detect platform and use correct launcher
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LAUNCHER="$SCRIPT_DIR/llm-server-mac"
+    # Fallback to llm-server if mac version doesn't exist (e.g. symlinked)
+    [[ ! -x "$LAUNCHER" ]] && LAUNCHER="$SCRIPT_DIR/llm-server"
+else
+    LAUNCHER="$SCRIPT_DIR/llm-server"
+fi
 
 # Help flag
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -94,8 +102,13 @@ while IFS= read -r file; do
     # Get total size (including all split parts)
     dir=$(dirname "$file")
     pattern=$(echo "$basename" | sed 's/-[0-9]*-of-[0-9]*\.gguf/.gguf/')
-    total_bytes=$(find "$dir" -name "${pattern%.gguf}*" -type f 2>/dev/null | xargs du -scb 2>/dev/null | tail -1 | awk '{print $1}')
-    [[ -z "$total_bytes" || "$total_bytes" == "0" ]] && total_bytes=$(du -sb "$file" | awk '{print $1}')
+    # Calculate total bytes (cross-platform: macOS stat -f%z, Linux stat --printf)
+    total_bytes=0
+    while IFS= read -r part; do
+        sz=$(stat -f%z "$part" 2>/dev/null || stat --printf="%s" "$part" 2>/dev/null || echo 0)
+        total_bytes=$(( total_bytes + sz ))
+    done < <(find "$dir" -name "${pattern%.gguf}*" -type f 2>/dev/null)
+    (( total_bytes == 0 )) && total_bytes=$(stat -f%z "$file" 2>/dev/null || stat --printf="%s" "$file" 2>/dev/null || echo 0)
     size_gb=$(awk "BEGIN {printf \"%.1f\", $total_bytes/1073741824}")
 
     # Detect MoE from filename patterns (A3B, A10B, etc.)
