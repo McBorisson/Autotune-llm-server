@@ -363,6 +363,9 @@ GGUF_TYPE_SIZE = {
 r = {'fused': 0, 'expert_bytes': 0, 'non_expert_bytes': 0}
 
 def skip_kv(f, kv_count):
+    # KV type sizes: 0=u8(1) 1=i8(1) 2=u16(2) 3=i16(2) 4=u32(4) 5=i32(4)
+    # 6=f32(4) 7=bool(1) 8=string 9=array 10=u64(8) 11=i64(8) 12=f64(8)
+    KV_FIXED = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
     for _ in range(kv_count):
         kl = struct.unpack('<Q', f.read(8))[0]
         key = f.read(kl).decode('utf-8', errors='replace')
@@ -376,17 +379,14 @@ def skip_kv(f, kv_count):
             if 'value_length' in key: r['vl'] = val
             if 'ssm.state_size' in key: r['ssm'] = 1
         elif vt == 8: f.read(struct.unpack('<Q', f.read(8))[0])
-        elif vt in (5, 6): f.read(4)
-        elif vt == 7: f.read(1)
-        elif vt in (0, 1): f.read(1)
-        elif vt in (2, 3): f.read(2)
-        elif vt == 10: f.read(8)
         elif vt == 9:
             at = struct.unpack('<I', f.read(4))[0]; al = struct.unpack('<Q', f.read(8))[0]
-            s = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8}
-            if at in s: f.read(al * s[at])
+            if at in KV_FIXED: f.read(al * KV_FIXED[at])
             elif at == 8:
                 for _ in range(al): f.read(struct.unpack('<Q', f.read(8))[0])
+            elif at == 9: break  # nested arrays: bail
+            else: break
+        elif vt in KV_FIXED: f.read(KV_FIXED[vt])
         else: break
 
 def read_tensors(f, tensor_count):
@@ -423,23 +423,22 @@ try:
         skip_kv(f, kv_count)
         read_tensors(f, tensor_count)
 
-    # For split GGUFs: if primary shard has no tensors, scan sibling shards
-    if tensor_count == 0:
-        m = re.search(r'-(\d+)-of-(\d+)\.gguf$', model_path)
-        if m:
-            total_shards = int(m.group(2))
-            base = model_path[:m.start()]
-            for shard_num in range(2, total_shards + 1):
-                shard_path = f'{base}-{shard_num:05d}-of-{total_shards:05d}.gguf'
-                if not os.path.exists(shard_path): continue
-                with open(shard_path, 'rb') as f:
-                    magic = f.read(4)
-                    if magic != b'GGUF': continue
-                    f.read(4)
-                    tc = struct.unpack('<Q', f.read(8))[0]
-                    kvc = struct.unpack('<Q', f.read(8))[0]
-                    skip_kv(f, kvc)
-                    read_tensors(f, tc)
+    # For split GGUFs: always scan all sibling shards (tensors may be spread across shards)
+    m = re.search(r'-(\d+)-of-(\d+)\.gguf$', model_path)
+    if m:
+        total_shards = int(m.group(2))
+        base = model_path[:m.start()]
+        for shard_num in range(2, total_shards + 1):
+            shard_path = f'{base}-{shard_num:05d}-of-{total_shards:05d}.gguf'
+            if not os.path.exists(shard_path): continue
+            with open(shard_path, 'rb') as f:
+                magic = f.read(4)
+                if magic != b'GGUF': continue
+                f.read(4)
+                tc = struct.unpack('<Q', f.read(8))[0]
+                kvc = struct.unpack('<Q', f.read(8))[0]
+                skip_kv(f, kvc)
+                read_tensors(f, tc)
 except: pass
 print(r.get('layers',0), r.get('experts',0), r.get('hkv',0), r.get('kl',0), r.get('vl',0), r.get('ssm',0), r.get('fused',0), r.get('expert_bytes',0), r.get('non_expert_bytes',0))
 " 2>/dev/null || echo "0 0 0 0 0 0 0 0 0")
