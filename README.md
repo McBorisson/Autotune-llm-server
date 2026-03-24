@@ -10,6 +10,68 @@ llm-server unsloth/Qwen3.5-27B-GGUF --download
 
 ![demo](demo.gif)
 
+## Why?
+
+Running llama.cpp on multi-GPU setups means juggling dozens of flags. llm-server figures it all out.
+
+<table>
+<tr><th>Without llm-server</th><th>With llm-server</th></tr>
+<tr>
+<td>
+
+```bash
+# Figure out layer count from GGUF metadata
+# Calculate VRAM split for 3090Ti + 4070 + 3060
+# Pick KV cache quant based on remaining headroom
+# Set tensor split ratios by PCIe bandwidth
+# Enable graph split mode for ik_llama
+# Handle fused tensors, MoE expert placement...
+
+llama-server \
+  -m model.gguf \
+  -ngl 81 \
+  --ctx-size 32768 \
+  --tensor-split 24,12,12 \
+  --split-mode graph \
+  -mg 0 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  -fa on \
+  --threads 8 \
+  --threads-batch 16 \
+  -b 4096 \
+  -ub 1024 \
+  --jinja \
+  --run-time-repack \
+  -khad \
+  -defrag-thold 0.1 \
+  --port 8081
+```
+
+</td>
+<td>
+
+```bash
+llm-server model.gguf
+```
+
+</td>
+</tr>
+</table>
+
+It auto-detects your GPUs, reads the GGUF metadata, calculates optimal memory layout, enables the right backend flags, and handles crash recovery — all from a single command.
+
+### Real-world benchmark
+
+Qwen3.5-27B Q4_K_M on 3090 Ti + 4070 + 3060 (ik_llama.cpp):
+
+| | Manual flags | llm-server | Improvement |
+|---|---|---|---|
+| **Prompt processing** | 160.9 tok/s | 254.0 tok/s | **+58%** |
+| **Token generation** | 26.8 tok/s | 41.5 tok/s | **+55%** |
+
+The "manual flags" run uses `-ngl 999 -fa on` and lets the server split across all 3 GPUs with default settings. llm-server recognized the model fits on the 3090 Ti alone — avoiding multi-GPU overhead — and enabled optimized KV quantization, Hadamard K-transform, run-time repacking, and prompt caching automatically.
+
 ## Features
 
 - **Built-in GGUF Downloader** — Use `--download` with any HuggingFace repo. Automatically recommends the best quantization based on your total VRAM and System RAM.
