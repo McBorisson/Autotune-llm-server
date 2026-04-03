@@ -272,6 +272,19 @@ log() { [[ "$VERBOSE" == "1" ]] && echo "[DEBUG] $*" >&2 || true; }
 # ═══════════════════════════════════════════════════════════════
 
 echo "═══ llm-server v$VERSION ═══"
+
+# Check if running an outdated installed copy
+LLM_SERVER_REPO="${LLM_SERVER_REPO:-$HOME/llm-server}"
+SELF_PATH="$(realpath "$0")"
+REPO_PATH="$(realpath "$LLM_SERVER_REPO/llm-server" 2>/dev/null || true)"
+if [[ -n "$REPO_PATH" && -f "$REPO_PATH" && "$SELF_PATH" != "$REPO_PATH" ]]; then
+    SELF_HASH=$(md5sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')
+    REPO_HASH=$(md5sum "$REPO_PATH" 2>/dev/null | awk '{print $1}')
+    if [[ "$SELF_HASH" != "$REPO_HASH" ]]; then
+        echo -e "\033[1;31m⚠ UPDATE AVAILABLE: installed copy is outdated. Run: cd $LLM_SERVER_REPO && ./install.sh\033[0m"
+    fi
+fi
+
 echo "Binary: $LLAMA_SERVER"
 (( IS_IK_LLAMA )) && echo "Backend: ik_llama.cpp (graph split enabled)"
 
