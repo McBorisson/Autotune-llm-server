@@ -1519,6 +1519,7 @@ run_with_restart() {
                 
                 local script_path=""
                 local search_paths=(
+                    "${OPENCODE_SCRIPT_PATH:-}"                      # User-configured path
                     "$base_dir/opencode/start-opencode.sh"           # Repo layout
                     "$base_dir/start-opencode.sh"                    # Flat layout
                     "$HOME/llm-server/opencode/start-opencode.sh"    # Common git clone fallback
@@ -1538,8 +1539,23 @@ run_with_restart() {
                     START_OPENCODE=0 # only run once
                 else
                     echo "Error: Could not find opencode/start-opencode.sh"
-                    echo "  Checked locations:"
-                    for path in "${search_paths[@]}"; do echo "    - $path"; done
+                    if [[ -t 0 && -t 1 ]]; then
+                        echo ""
+                        read -rp "Please enter the full path to your start-opencode.sh: " user_path
+                        user_path="${user_path/#\~/$HOME}"
+                        if [[ -f "$user_path" ]]; then
+                            echo "OPENCODE_SCRIPT_PATH=\"$user_path\"" >> "$CONFIG_FILE"
+                            echo "✓ Path saved to $CONFIG_FILE"
+                            echo "Launching OpenCode via $user_path..."
+                            "$user_path" &
+                            START_OPENCODE=0
+                        else
+                            echo "Error: File not found at $user_path"
+                        fi
+                    else
+                        echo "  Checked locations:"
+                        for path in "${search_paths[@]}"; do echo "    - $path"; done
+                    fi
                 fi
             fi
 
