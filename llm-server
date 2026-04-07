@@ -22,7 +22,7 @@
 #   llm-server <model.gguf> --vision           # Auto-detect/download mmproj for vision
 #   llm-server <model.gguf> --mmproj auto      # Same as --vision
 #   llm-server <model.gguf> --mmproj proj.gguf # Enable vision with specific mmproj file
-#   llm-server <model.gguf> --ai-tune          # AI-driven flag optimization (8 rounds)
+#   llm-server <model.gguf> --ai-tune          # AI-driven flag optimization (10 rounds)
 #   llm-server <model.gguf> --ai-tune --retune # Force re-tune even if cache exists
 #
 # Environment variables:
@@ -90,23 +90,41 @@ trap cleanup EXIT
 # This solves the issue where libraries are scattered in build subfolders.
 setup_lib_hub() {
     local bin_path="$1"
+    local bin_dir
+    bin_dir="$(dirname "$bin_path")"
     local build_root
-    build_root="$(dirname "$(dirname "$bin_path")")"
-    
+    build_root="$(dirname "$bin_dir")"
+
     if [[ ! -d "$build_root" ]]; then return; fi
 
     # Create fresh hub dir
     [[ -n "$LIB_HUB_DIR" && -d "$LIB_HUB_DIR" ]] && rm -rf "$LIB_HUB_DIR"
     LIB_HUB_DIR=$(mktemp -d /tmp/llm-lib-hub.XXXXXX)
-    
-    # Find and symlink all .so files
-    find "$build_root" -name "*.so" -type f -exec ln -sf {} "$LIB_HUB_DIR/" \; 2>/dev/null
-    
+
+    # Find and symlink all .so files (real files only — versioned .so.0.9.7 etc.)
+    find "$build_root" -name "*.so*" -type f -exec ln -sf {} "$LIB_HUB_DIR/" \; 2>/dev/null
+
+    # Fix broken versioned symlink chains: if binary needs libfoo.so.0 but only
+    # libfoo.so.0.9.7 exists (common after partial rebuilds), create the missing link
+    for real_lib in "$LIB_HUB_DIR"/*.so.*.*; do
+        [[ -f "$real_lib" ]] || continue
+        local base
+        base="$(basename "$real_lib")"
+        # Extract libfoo.so.0 from libfoo.so.0.9.7
+        local so_major="${base%.*.*}"
+        [[ "$so_major" != "$base" && ! -e "$LIB_HUB_DIR/$so_major" ]] && \
+            ln -sf "$real_lib" "$LIB_HUB_DIR/$so_major"
+        # Extract libfoo.so from libfoo.so.0.9.7
+        local so_base="${base%%\.so\.*}.so"
+        [[ ! -e "$LIB_HUB_DIR/$so_base" ]] && \
+            ln -sf "$real_lib" "$LIB_HUB_DIR/$so_base"
+    done
+
     # Export the hub to the library path
     export LD_LIBRARY_PATH="$LIB_HUB_DIR:${LD_LIBRARY_PATH:-}"
-    
+
     # Also add the binary's directory for good measure
-    export LD_LIBRARY_PATH="$(dirname "$bin_path"):$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="${bin_dir}:$LD_LIBRARY_PATH"
 }
 
 # Auto-detect llama-server binary
@@ -261,6 +279,14 @@ if (( DO_UPDATE )); then
 
         # Pull latest
         echo "  Pulling latest..."
+        # Handle detached head
+        if ! git symbolic-ref -q HEAD >/dev/null; then
+            echo "  Warning: detached HEAD detected. Checking out default branch..."
+            local default_branch
+            default_branch=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+            [[ -z "$default_branch" ]] && default_branch="master"
+            git checkout "$default_branch"
+        fi
         if ! git pull --ff-only 2>&1 | tail -3; then
             echo "  Warning: fast-forward pull failed, trying rebase..."
             if ! git pull --rebase 2>&1 | tail -3; then
@@ -356,10 +382,9 @@ if (( DO_UPDATE )); then
 
     # Show what's available now
     for dir in "$IK_DIR" "$MAIN_DIR"; do
-        local_bin="$dir/build/bin/llama-server"
-        if [[ -x "$local_bin" ]]; then
-            local ver
-            ver=$("$local_bin" --version 2>/dev/null | grep -m1 "version:" || echo "unknown")
+        curr_bin="$dir/build/bin/llama-server"
+        if [[ -x "$curr_bin" ]]; then
+            ver=$("$curr_bin" --version 2>/dev/null | grep -m1 "version:" || echo "unknown")
             [[ "$ver" == "unknown" ]] && ver=$(cd "$dir" && git log --oneline -1 2>/dev/null || echo "unknown")
             echo "  $(basename "$dir"): $ver"
         fi
@@ -403,11 +428,42 @@ if [[ -n "$USER_LIB_PATH" ]]; then
     export LD_LIBRARY_PATH="${USER_LIB_PATH}:${LD_LIBRARY_PATH:-}"
 fi
 
+# Verify binary can actually run (catches broken shared lib chains)
+# Note: --help exits 1 normally, so check for shared lib errors in output instead
+_bin_check=$(timeout 5 "$LLAMA_SERVER" --help 2>&1 || true)
+if [[ "$_bin_check" == *"shared libraries"* ]]; then
+    echo "Error: $LLAMA_SERVER has broken shared libraries:"
+    echo "$_bin_check" | grep "shared libraries" | head -3
+    echo ""
+    echo "Fix: rebuild (cmake --build build --config Release)"
+    # Try the other backend before giving up
+    if [[ "$LLAMA_SERVER" == *ik_llama* ]]; then
+        ALT_BIN="$HOME/llama.cpp/build/bin/llama-server"
+    else
+        ALT_BIN="$HOME/ik_llama.cpp/build/bin/llama-server"
+    fi
+    if [[ -x "$ALT_BIN" ]]; then
+        setup_lib_hub "$ALT_BIN"
+        _alt_check=$(timeout 5 "$ALT_BIN" --help 2>&1 || true)
+        if [[ "$_alt_check" != *"shared libraries"* ]]; then
+            echo "Falling back to: $ALT_BIN"
+            LLAMA_SERVER="$ALT_BIN"
+        else
+            echo "Error: Both backends have broken shared libraries."
+            exit 1
+        fi
+    else
+        exit 1
+    fi
+fi
+
 # Detect if we're running ik_llama.cpp (supports --split-mode graph)
+# Note: can't use pipe + grep -q under pipefail (SIGPIPE kills pipe).
+# Reuse _bin_check from above, or check path.
 IS_IK_LLAMA=0
 if [[ "$LLAMA_SERVER" == *ik_llama* ]]; then
     IS_IK_LLAMA=1
-elif timeout 5 "$LLAMA_SERVER" --help 2>&1 | grep -q 'graph' 2>/dev/null; then
+elif [[ "${_bin_check:-}" == *ikawrakow* || "${_bin_check:-}" == *"split-mode-graph"* ]]; then
     IS_IK_LLAMA=1
 fi
 
@@ -787,9 +843,14 @@ fi
 setup_lib_hub "$LLAMA_SERVER"
 
 # Detect if we're running ik_llama.cpp (supports --split-mode graph)
+# Note: can't pipe --help | grep -q under pipefail — --help exits 1 and grep -q
+# causes SIGPIPE, both propagate as pipe failure. Use path check + variable instead.
 IS_IK_LLAMA=0
-if "$LLAMA_SERVER" --help 2>&1 | grep -q "ikawrakow"; then
+if [[ "$LLAMA_SERVER" == *ik_llama* ]]; then
     IS_IK_LLAMA=1
+else
+    _help_out=$("$LLAMA_SERVER" --help 2>&1 || true)
+    [[ "$_help_out" == *ikawrakow* ]] && IS_IK_LLAMA=1
 fi
 
 (( IS_IK_LLAMA )) && echo "Backend: ik_llama.cpp (graph split enabled)" || echo "Backend: llama.cpp (mainline)"
@@ -1562,7 +1623,7 @@ run_with_restart() {
 # Section 6b: AI Tune — iterative LLM-driven flag optimization
 # ═══════════════════════════════════════════════════════════════
 
-AI_TUNE_ROUNDS=8
+AI_TUNE_ROUNDS=10
 TUNE_HISTORY_FILE="$CACHE_DIR/tune_history.jsonl"
 
 # Append a round result to the persistent history log
