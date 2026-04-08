@@ -24,32 +24,33 @@ The model being served proposes its own optimal flags, benchmarks each one, lear
 
 ```
 Round 0/8: Benchmarking baseline (heuristic config)...
-  Baseline: gen=25.94 tok/s  pp=150.54 tok/s
-Round 1/8: Config: hadamard + repack
-  Result: gen=25.91 tok/s (-0.1%)
-Round 2/8: Config: no-mmap + mlock + single GPU isolation
-  ★ NEW BEST: gen=39.69 tok/s (+53.0%)
-Round 3/8: Config: q8_0 KV cache + larger ubatch
-  ★ NEW BEST: gen=39.76 tok/s (+53.3%)
-...
-AI Tune complete: +54% generation speed
+  Baseline: gen=23.17 tok/s  pp=119.87 tok/s
+Round 1/8: Config: optimized_split_hadamard_v2
+  Result: gen=22.05 tok/s (-4.8%)
+Round 3/8: Config: optimized_tensor_split_q4
+  ★ NEW BEST: gen=24.56 tok/s (+6.0%)
+Round 7/8: Config: ultra_stable_3090ti_bias
+  ★ NEW BEST: gen=24.77 tok/s (+6.9%)
+
+AI Tune complete: ultra_stable_3090ti_bias wins!
+  Baseline: 23.17 tok/s → Best: 24.77 tok/s (+6.9%)
 ```
 
 No external API needed. No internet required. The model tunes itself using its own intelligence. Results are cached — run `--ai-tune` once, benefit forever.
 
-| | Before AI Tune | After AI Tune | Improvement |
+| Model | Before | After | Improvement |
 |---|---|---|---|
-| **Generation** | 25.94 tok/s | 40.05 tok/s | **+54%** |
-| **Prompt processing** | 150 tok/s | 228 tok/s | **+52%** |
+| **Qwen3.5-27B Q4_K_M** | 25.94 tok/s | 40.05 tok/s | **+54% gen** |
+| **gemma-4-31B UD-Q4_K_XL** | 23.17 tok/s | 24.77 tok/s | **+6.9% gen** |
 
-*Qwen3.5-27B Q4_K_M on RTX 3090 Ti + RTX 4070 + RTX 3060*
+*RTX 3090 Ti + RTX 4070 + RTX 3060 (49GB total VRAM)*
 
 ### How it works
 
 1. Launches with heuristic config → benchmarks as baseline
 2. Queries the running model: "Here's my hardware, the full --help, and the baseline. Propose a better config."
 3. Parses the JSON response, launches with proposed flags, benchmarks
-4. Feeds results back: "That got 39.69 tok/s. Try to beat it."
+4. Feeds results back: "That got 24.56 tok/s. Try to beat it."
 5. Repeats for 8 rounds (crashes get free retries). Saves the winner to cache.
 6. Next `llm-server model.gguf` → uses cached config instantly
 
@@ -106,7 +107,7 @@ llm-server model.gguf
 
 ## Features
 
-- **AI Self-Tuning** — `--ai-tune` lets the model optimize its own server flags. 8 rounds of iterative benchmarking (crashes get free retries). Cached for instant reuse. +54% generation speed in real tests.
+- **AI Self-Tuning** — `--ai-tune` lets the model optimize its own server flags. 8 rounds of iterative benchmarking (crashes get free retries, large models get OOM protection). Cached for instant reuse. Up to +54% generation speed in real tests.
 - **Built-in GGUF Downloader** — Use `--download` with any HuggingFace repo. Automatically recommends the best quantization based on your total VRAM and System RAM.
 - **Native Fused Support** — Full compatibility with fused `ffn_up_gate` models (e.g., AesSedai) using high-performance `ik_llama.cpp` kernels.
 - **Lib Hub** — Automatically symlinks all required `.so` libraries into a temporary directory, solving library path issues.
@@ -188,10 +189,12 @@ llm-server-gui
 The model being served acts as its own performance consultant:
 1. Runs heuristic config as baseline → benchmarks
 2. Sends the model its hardware profile, GGUF metadata, full `--help` output, and baseline results
-3. Model proposes a flag config as JSON → script benchmarks it
+3. Model proposes flag overrides as JSON → script applies them on top of the baseline, benchmarks
 4. Results fed back → model proposes next config → repeat for 8 rounds
-5. Winner cached at `~/.cache/llm-server/` — used automatically on future launches
-6. All results persisted to `tune_history.jsonl` — the model learns across sessions
+5. Crashes get free retries (up to 4). Large models (>70% system memory) get a confirmation prompt.
+6. Server processes are marked as OOM-kill targets — a bad config kills the server, never your system.
+7. Winner cached at `~/.cache/llm-server/` — used automatically on future launches
+8. All results persisted to `tune_history.jsonl` — the model learns across sessions
 
 No external API, no internet, no dependencies. The model tunes itself.
 
@@ -210,17 +213,17 @@ Many models support image input via a separate mmproj (multimodal projector) fil
 You can also use `--mmproj path/to/mmproj.gguf` to specify a file directly.
 
 ### Auto-update
-`llm-server --update` updates both ik_llama.cpp and llama.cpp backends safely:
-1. Backs up the current working binary
-2. `git pull` the latest changes
-3. Rebuilds with the existing cmake configuration (preserves your CUDA flags)
+`llm-server --update` updates ik_llama.cpp, llama.cpp backends, and llm-server itself:
+1. Pulls the latest llm-server repo and re-runs `install.sh`
+2. Backs up each backend's current working binary
+3. `git pull` + rebuild with the existing cmake config (preserves your CUDA flags)
 4. Smoke-tests the new binary
 5. If the build fails or the binary crashes → rolls back to the previous commit and restores the backup
 
-This means you can update fearlessly — a broken upstream commit won't leave you without a working server.
+Update fearlessly — a broken upstream commit won't leave you without a working server.
 
 ### Auto-fallback
-If ik_llama.cpp can't load a model (e.g., unsupported architecture like Gemma 4), llm-server automatically:
+If ik_llama.cpp can't load a model (unsupported architecture), llm-server automatically:
 1. Detects the load failure from the server log
 2. Switches to mainline llama.cpp
 3. Strips ik_llama-specific flags (graph split, checkpoints, etc.)
