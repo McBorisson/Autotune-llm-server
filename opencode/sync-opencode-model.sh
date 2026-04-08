@@ -29,8 +29,8 @@ if [ -z "$SERVER_CTX" ] || [ "$SERVER_CTX" == "null" ]; then
     SERVER_CTX=65536
 fi
 
-# 3. Calculate the safe limit (10% less than server context)
-SAFE_CTX=$(( SERVER_CTX * 90 / 100 ))
+# 3. Calculate the safe limit (5% less than server context)
+SAFE_CTX=$(( SERVER_CTX * 95 / 100 ))
 
 echo "Server context: $SERVER_CTX | OpenCode safe limit: $SAFE_CTX"
 

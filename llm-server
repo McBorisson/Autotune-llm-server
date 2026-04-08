@@ -1387,6 +1387,8 @@ try_start() {
         "$LLAMA_SERVER" "${COMMON_FLAGS[@]}" "${extra_flags[@]}" > >(tee -a "$SERVER_LOG") 2>&1 &
     fi
     local pid=$!
+    # Mark server as OOM-kill target so it dies instead of the whole system
+    echo 1000 > "/proc/$pid/oom_score_adj" 2>/dev/null || true
     local i=0
     while (( i < HEALTH_TIMEOUT )); do
         if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
@@ -1502,6 +1504,8 @@ run_with_restart() {
         echo "Starting server..."
         "$LLAMA_SERVER" "${flags[@]}" > >(tee -a "$SERVER_LOG" | grep -v --line-buffered "record AND rewind is invalid") 2>&1 &
         local pid=$!
+        # Mark server as OOM-kill target so it dies instead of the whole system
+        echo 1000 > "/proc/$pid/oom_score_adj" 2>/dev/null || true
         echo "Server PID: $pid"
 
         # Wait for health before declaring success
@@ -1837,6 +1841,14 @@ HWEOF
 
 # Build model profile JSON
 build_model_profile() {
+    # Calculate current KV cache size for budget info
+    local kv_label="unknown"
+    case "${KV_QUALITY:-}" in
+        f16) kv_label="f16 (${KV_TOTAL_MB:-0}MB)" ;;
+        q8_0) kv_label="q8_0 (${KV_TOTAL_MB:-0}MB)" ;;
+        q4_0) kv_label="q4_0 (${KV_TOTAL_MB:-0}MB)" ;;
+        *) kv_label="${KV_QUALITY:-?} (${KV_TOTAL_MB:-0}MB)" ;;
+    esac
     cat <<MPEOF
 {
   "name": "${MODEL_NAME}",
@@ -1847,7 +1859,11 @@ build_model_profile() {
   "kv_heads": ${HEAD_COUNT_KV},
   "is_moe": ${IS_MOE:-0},
   "has_fused": ${HAS_FUSED},
-  "backend": "$(if (( IS_IK_LLAMA )); then echo "ik_llama.cpp"; else echo "llama.cpp (mainline)"; fi)"
+  "backend": "$(if (( IS_IK_LLAMA )); then echo "ik_llama.cpp"; else echo "llama.cpp (mainline)"; fi)",
+  "kv_cache": "${kv_label}",
+  "total_vram_mb": ${TOTAL_VRAM_MB:-0},
+  "total_ram_mb": ${RAM_AVAIL_MB:-0},
+  "strategy": "${STRATEGY}"
 }
 MPEOF
 }
@@ -1923,41 +1939,40 @@ except:
 
 # Build fixed flags string (these never change during tuning)
 build_fixed_flags() {
-    echo "-m \"${MODEL_PATH}\" --host \"${HOST}\" --port \"${PORT}\" --ctx-size \"${CTX_SIZE}\""
+    local flags="-m \"${MODEL_PATH}\" --host \"${HOST}\" --port \"${PORT}\" --ctx-size \"${CTX_SIZE}\""
+    # Include MoE placement flags if set
+    if (( ${#TUNE_EXTRA_FIXED[@]} > 0 )); then
+        flags+=" ${TUNE_EXTRA_FIXED[*]}"
+    fi
+    echo "$flags"
 }
 
-# Merge fixed flags + LLM override flags into a bash-ready array
+# Convert LLM JSON overrides into extra flags array for try_start
 # Args: $1 = JSON object of flag overrides {"--flag": "value", ...}
-# Prints space-separated flags
-merge_tune_flags() {
+# Sets TUNE_OVERRIDE_FLAGS array — these get passed to try_start ON TOP of COMMON_FLAGS
+TUNE_EXTRA_FIXED=()
+declare -a TUNE_OVERRIDE_FLAGS=()
+parse_tune_overrides() {
     local overrides_json="$1"
-    python3 -c "
-import json, sys, shlex
-
-fixed = {
-    '-m': '${MODEL_PATH}',
-    '--host': '${HOST}',
-    '--port': '${PORT}',
-    '--ctx-size': '${CTX_SIZE}',
-}
-
+    TUNE_OVERRIDE_FLAGS=()
+    local flags_str
+    flags_str=$(python3 -c "
+import json, sys
 overrides = json.loads(sys.stdin.read())
-
-# Start with fixed, add overrides
-flags = dict(fixed)
-for k, v in overrides.items():
-    if k in ('-m', '--host', '--port', '--ctx-size'):
-        continue  # never override fixed flags
-    flags[k] = v
-
-# Build command line
 parts = []
-for k, v in flags.items():
+for k, v in overrides.items():
+    # Skip flags already in COMMON_FLAGS (protected)
+    if k in ('-m', '--host', '--port', '--ctx-size', '-ot'):
+        continue
+    if v is False:
+        continue  # LLM wants to remove — we just don't add it
     parts.append(k)
     if v is not True and v != '' and v is not None:
         parts.append(str(v))
 print(' '.join(parts))
-" <<< "$overrides_json"
+" <<< "$overrides_json") || true
+    # shellcheck disable=SC2206
+    [[ -n "$flags_str" ]] && TUNE_OVERRIDE_FLAGS=($flags_str)
 }
 
 # Main AI tune function — iterative: benchmark → query → benchmark → query ...
@@ -2050,27 +2065,49 @@ print(f'  Tuned: {d.get(\"tuned_at\", \"?\")}')" 2>/dev/null
     # Build the system prompt (sent once, contains all static context)
     local system_prompt
     system_prompt=$(cat <<'SYSEOF'
-You are an expert performance tuner for llama.cpp and ik_llama.cpp inference servers.
+You are an expert performance tuner for llama.cpp inference servers.
 
-Your job: propose server flag configurations that maximize GENERATION tok/s.
+Your goal: maximize GENERATION tok/s while preserving output quality.
+Speed is the primary metric. Quality must not be sacrificed for marginal speed gains.
 
 # How this works
 - I give you hardware info, model info, the full --help output, and the current config + benchmark results
 - You propose ONE config per round
-- I benchmark it and tell you the results
+- I benchmark it and tell you the results (or report a crash)
 - You learn from each result and propose a better config next round
-- We do this for multiple rounds
+- We do 8 rounds. Make each one count — never repeat a failed or worse config.
+
+# Optimization priority (in order)
+1. GPU split strategy: single GPU > graph split > row split > layer split
+2. Flash attention: enable it — faster and unlocks KV quantization
+3. KV cache quantization: q8_0 is the sweet spot (2x VRAM savings, negligible quality loss). q4_0 saves 4x VRAM but degrades long-context quality — only use if VRAM-starved.
+4. Batch size tuning: 2048-4096 is usually optimal. Above 4096 = diminishing returns.
+5. Thread count: generation threads = physical CPU cores. Hyperthreads don't help.
+6. Memory flags: --no-mmap when model spans GPU + RAM. --mlock pins RAM (less swapping).
+
+# Quality guardrails
+- Prefer q8_0 KV over q4_0 — the speed difference is small but quality difference is real
+- Quantized KV cache REQUIRES --flash-attn — crashes without it
+- Don't reduce context size to gain speed — it cripples usability
+- --parallel 1 unless multi-user is explicitly needed (extra slots waste VRAM)
+
+# Crash recovery
+- If a config crashed, your next proposal must be MORE conservative on the likely cause
+- OOM = reduce batch, increase KV quantization, or spread across more GPUs
+- Immediate crash = you used an unsupported or invalid flag — remove it
+- Never repeat a config that crashed. Build on what worked instead.
 
 # Rules
-1. These flags are FIXED by the launcher (do not include them):
-   {fixed_flags}
-2. Return ALL other flags you want as a JSON object: {"--flag": "value", ...}
-3. Boolean flags (no value) use: {"--no-mmap": true, "--mlock": true}
-4. Your response MUST contain a JSON object with these keys:
+1. The baseline config flags are ALREADY applied. You only propose CHANGES.
+2. Your "flags" JSON should contain ONLY flags you want to ADD or OVERRIDE.
+   Example: {"--batch-size": "4096", "--flash-attn": "on"} — these replace the baseline values.
+3. Boolean flags: {"--no-mmap": true, "--mlock": true}
+4. To remove a baseline flag: {"--some-flag": false}
+5. These flags are FIXED (never include them): {fixed_flags}
+6. Your response MUST contain a JSON object with these keys:
    {"name": "short description", "flags": {...}, "reasoning": "why this should be faster"}
-5. Think carefully about VRAM budget — if a config OOMs, use less VRAM next round
-6. Think about GPU topology — PCIe bandwidth matters for multi-GPU
-7. Single GPU is faster than multi-GPU IF the model fits
+7. Think carefully about VRAM budget — total VRAM minus model size = room for KV + batch buffers
+8. ONLY use flags from the --help output. Unknown flags crash the server.
 SYSEOF
 )
     # Replace {fixed_flags} placeholder
@@ -2092,16 +2129,26 @@ ${help_text}
 Flags: ${baseline_flags_desc}
 Benchmark: gen=${baseline_gen} tok/s, pp=${baseline_pp} tok/s
 
-# Performance guide
-- Single GPU > Multi GPU (avoid inter-GPU transfer overhead)
-- graph split > row split > layer split for multi-GPU
-- q4_0 KV saves ~4x VRAM vs f16 (frees room for bigger batch or single-GPU fit)
-- batch 2048-4096 is usually optimal, above 4096 diminishing returns
-- threads for gen = physical cores, hyperthreads don't help
-- --no-mmap needed when model partly on GPU + partly on RAM
-- Quantized KV cache (q4_0/q8_0) REQUIRES --flash-attn on — crashes without it
-- ONLY use flags that appear in the --help output above. Unknown flags crash the server.
-- Check the "backend" field in Model info to know which server you're tuning.
+# VRAM/RAM safety budget
+- Model size: ${TOTAL_SIZE_MB}MB | KV cache: ${KV_TOTAL_MB:-0}MB (${KV_QUALITY:-?})
+- Total VRAM: ${TOTAL_VRAM_MB:-0}MB | Total RAM: ${RAM_AVAIL_MB:-0}MB
+- KV cache sizes at ctx=${CTX_SIZE}: q4_0≈${KV_TOTAL_MB:-0}MB, q8_0≈$((KV_TOTAL_MB * 2))MB, f16≈$((KV_TOTAL_MB * 4))MB
+- CRITICAL: If model+KV+batch already uses >90% of VRAM+RAM, do NOT increase KV cache size (q4_0→q8_0 doubles it!)
+- Increasing batch size also uses more VRAM. Stay within budget.
+- If baseline uses q4_0 KV, it's likely because VRAM is tight — respect that choice unless headroom exists.
+
+# Performance + quality guide
+- Single GPU > Multi GPU (eliminates inter-GPU transfer overhead)
+- graph split > row split > layer split (when multi-GPU is needed)
+- --flash-attn: almost always faster, required for quantized KV cache
+- KV cache q8_0: best speed/quality tradeoff (2x VRAM savings vs f16, negligible quality loss) — BUT 2x bigger than q4_0
+- KV cache q4_0: 4x VRAM savings vs f16, slight quality loss on long contexts — use when VRAM is tight
+- batch 2048-4096 usually optimal, above 4096 = diminishing returns
+- threads for gen = physical CPU cores, hyperthreads don't help
+- --no-mmap when model is split across GPU + system RAM
+- Quantized KV (q4_0/q8_0) REQUIRES --flash-attn — crashes without it
+- ONLY use flags from the --help output above. Unknown flags crash the server.
+- Check the "backend" field in Model info to know which server binary you're tuning.
 
 # Previous tuning history (learn from past results!)
 ${tune_history}
@@ -2201,10 +2248,9 @@ print(json.dumps(msgs))
         echo "  Config: ${config_name}"
         echo "  Reason: ${config_reasoning}"
 
-        # Merge fixed flags + LLM overrides
-        local merged_flags
-        merged_flags=$(merge_tune_flags "$config_flags_json")
-        echo "  Flags: ${merged_flags}"
+        # Parse LLM overrides into flag array
+        parse_tune_overrides "$config_flags_json"
+        echo "  Overrides: ${TUNE_OVERRIDE_FLAGS[*]:-none}"
 
         # Add assistant response to conversation
         echo "$llm_response" > "$tune_msg_dir/resp_${round}.txt"
@@ -2215,35 +2261,47 @@ msgs.append({'role': 'assistant', 'content': open('${tune_msg_dir}/resp_${round}
 print(json.dumps(msgs))
 " <<< "$messages")
 
-        # Kill current server, start with new config
+        # RAM safety check — will this config OOM the system?
+        # Uses total RAM (not available) since baseline is killed before test starts
+        # 5GB reserved for OS/other processes
+        local est_kv_mb=${KV_TOTAL_MB:-0}
+        local proposed_kv_k proposed_kv_v
+        proposed_kv_k=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('--cache-type-k',''))" 2>/dev/null) || true
+        proposed_kv_v=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('--cache-type-v',''))" 2>/dev/null) || true
+        if [[ -n "$proposed_kv_k" || -n "$proposed_kv_v" ]]; then
+            local kv_mult=1
+            case "${proposed_kv_k:-${KV_QUALITY:-q4_0}}" in
+                f16)  kv_mult=4 ;;
+                q8_0) kv_mult=2 ;;
+                q4_0) kv_mult=1 ;;
+            esac
+            est_kv_mb=$(( KV_TOTAL_MB * kv_mult ))
+        fi
+        local est_total_mb=$(( TOTAL_SIZE_MB + est_kv_mb + 2048 ))  # model + KV + batch buffers
+        local total_ram_mb
+        total_ram_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null) || total_ram_mb=${RAM_AVAIL_MB}
+        local system_total_mb=$(( TOTAL_VRAM_MB + total_ram_mb - 5120 ))  # 5GB OS reserve
+        if (( est_total_mb > system_total_mb )); then
+            echo "  SKIPPED — estimated ${est_total_mb}MB > system capacity ${system_total_mb}MB (OOM protection)"
+            echo "Result for '${config_name}': SKIPPED — needs ~${est_total_mb}MB (model ${TOTAL_SIZE_MB}MB + KV ${est_kv_mb}MB) but system has ${system_total_mb}MB usable. Do NOT increase KV cache or batch. Try other flags." > "$tune_msg_dir/feedback_${round}.txt"
+            messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.stdin.read())
+msgs.append({'role': 'user', 'content': open('${tune_msg_dir}/feedback_${round}.txt').read()})
+print(json.dumps(msgs))
+" <<< "$messages")
+            # Baseline is still running — no restart needed
+            continue
+        fi
+
+        # Kill current server, start with new config (COMMON_FLAGS + overrides)
         kill_server "$RUNNING_PID"
         sleep 1
 
-        # Start server with merged flags
-        local flag_array
-        # shellcheck disable=SC2206
-        flag_array=($merged_flags)
-
-        RUNNING_PID=""
-        (set +e; "$LLAMA_SERVER" "${flag_array[@]}" 2>&1 | tee -a "$SERVER_LOG") &
-        local pid=$!
-        local healthy=0
-        local i=0
-        while (( i < HEALTH_TIMEOUT )); do
-            if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-                healthy=1
-                RUNNING_PID=$pid
-                break
-            fi
-            if ! kill -0 "$pid" 2>/dev/null; then break; fi
-            sleep 1; (( ++i ))
-        done
-
         local round_gen="0" round_pp="0" round_status="ok"
 
-        if (( ! healthy )); then
+        if ! try_start "${TUNE_OVERRIDE_FLAGS[@]}"; then
             echo "  CRASHED — config failed to start"
-            kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
             kill_server ""
             round_status="crashed"
             (( ++crash_retries ))
@@ -2307,7 +2365,7 @@ print(json.dumps(results))
         # Feed result back to LLM for next round
         local feedback
         if [[ "$round_status" == "crashed" ]]; then
-            feedback="Result for '${config_name}': CRASHED (server failed to start — likely OOM or invalid flags). Current best: gen=${best_gen} tok/s. Baseline: gen=${baseline_gen} tok/s. Try a safer config next."
+            feedback="Result for '${config_name}': CRASHED (server failed to start — likely OOM or invalid flags). Current best: gen=${best_gen} tok/s. Baseline: gen=${baseline_gen} tok/s. IMPORTANT: Do NOT increase memory usage (bigger KV cache, bigger batch) — this system is memory-constrained. Try changing non-memory flags instead (threads, split mode, micro-batch)."
         else
             feedback="Result for '${config_name}': gen=${round_gen} tok/s, pp=${round_pp} tok/s (baseline: gen=${baseline_gen}, best so far: gen=${best_gen}). Propose your next config."
         fi
@@ -2434,7 +2492,8 @@ print(f'  Expected: gen={b.get(\"gen_tps\", \"?\")} tok/s  pp={b.get(\"pp_tps\",
 # ═══════════════════════════════════════════════════════════════
 
 # AI Tune: run optimization if requested
-if (( DO_AI_TUNE )); then
+# MoE models: ai-tune runs AFTER Section 8 expert placement (see end of Section 8)
+if (( DO_AI_TUNE )) && [[ "$STRATEGY" != "moe_offload" ]]; then
     ai_tune
 fi
 
@@ -2703,6 +2762,16 @@ if [[ -f "$CACHE_FILE" && "$RETUNE" == "0" && -n "${CACHED_GPU_ASSIGNMENTS:-}" ]
             print_cmd "${LAUNCH_FLAGS[@]}"
             exit 0
         fi
+        # AI Tune with cached MoE placement locked
+        if (( DO_AI_TUNE )); then
+            echo ""
+            echo "MoE placement loaded from cache. Running AI Tune with placement locked..."
+            COMMON_FLAGS+=(--no-mmap -ot "$OT_STRING")
+            TUNE_EXTRA_FIXED=(--no-mmap -ot "$OT_STRING")
+            ai_tune
+            kill_server "$RUNNING_PID"
+            run_with_restart "${COMMON_FLAGS[@]}"
+        fi
         run_with_restart "${LAUNCH_FLAGS[@]}"
     else
         echo "  Cached config invalid for current VRAM — retuning..."
@@ -2959,9 +3028,23 @@ CEOF
     echo "  Config cached: $CACHE_FILE"
     echo "═══════════════════════════════════════════"
 
+    # AI Tune on top of MoE placement: optimize flags with placement locked
+    if (( DO_AI_TUNE )); then
+        echo ""
+        echo "MoE placement complete. Running AI Tune with placement locked..."
+        COMMON_FLAGS+=(--no-mmap -ot "$OT_STRING")
+        TUNE_EXTRA_FIXED=(--no-mmap -ot "$OT_STRING")
+        ai_tune
+    fi
+
     # Kill the tuning server, restart via the crash-safe loop
     kill_server "$RUNNING_PID"
-    run_with_restart "${COMMON_FLAGS[@]}" --no-mmap -ot "$OT_STRING"
+    # If ai-tune already added placement flags to COMMON_FLAGS, don't duplicate
+    if (( DO_AI_TUNE )); then
+        run_with_restart "${COMMON_FLAGS[@]}"
+    else
+        run_with_restart "${COMMON_FLAGS[@]}" --no-mmap -ot "$OT_STRING"
+    fi
 else
     echo "FAILED: Could not start server even with conservative config."
     echo "Check $SERVER_LOG for details."
