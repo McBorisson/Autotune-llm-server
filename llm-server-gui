@@ -144,7 +144,14 @@ if _should_check_updates; then
 
     if (( ${#_updates[@]} > 0 )); then
         echo -e "\033[1;31m⚠ Updates available: ${_updates[*]}\033[0m"
-        read -r -t 15 -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        # Handle prompt only if running in an interactive terminal
+        if [[ -t 0 ]]; then
+            UPDATE_TIMEOUT="${LLM_SERVER_UPDATE_TIMEOUT:-30}"
+            read -r -t "$UPDATE_TIMEOUT" -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        else
+            _answer=""
+        fi
+
         case "${_answer,,}" in
             y)
                 echo "Running update..."
@@ -157,7 +164,11 @@ if _should_check_updates; then
                 echo "  Dismissed for ${UPDATE_DISMISS_DAYS} days."
                 ;;
             *)
-                echo "  Skipped."
+                if [[ -t 0 ]]; then
+                    echo "  Update skipped due to timeout or user input."
+                else
+                    echo "  Non-interactive mode: skipping update prompt."
+                fi
                 ;;
         esac
         echo ""
