@@ -37,7 +37,7 @@ echo "Server context: $SERVER_CTX | OpenCode safe limit: $SAFE_CTX"
 # 4. Update opencode.json using jq
 TMP_FILE=$(mktemp)
 jq --arg mid "$MODEL_ID" --argjson ctx "$SAFE_CTX" \
-   '.provider["llama-cpp"].models = {($mid): {"name": $mid, "limit": {"context": $ctx, "output": 16384}}} | .model = "llama-cpp/" + $mid' \
+   '.provider["llama-cpp"].models = {($mid): {"name": $mid, "limit": {"context": $ctx, "output": 64000}}} | .model = "llama-cpp/" + $mid' \
    "$CONFIG_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CONFIG_FILE"
 
 if [ $? -eq 0 ]; then
