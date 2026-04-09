@@ -141,38 +141,36 @@ if _should_check_updates; then
     [[ -d "$_ik_dir" ]] && _check_repo_behind "$_ik_dir" "ik_llama.cpp" && _updates+=("ik_llama.cpp")
     _ll_dir="$HOME/llama.cpp"
     [[ -d "$_ll_dir" ]] && _check_repo_behind "$_ll_dir" "llama.cpp" && _updates+=("llama.cpp")
-
-    if (( ${#_updates[@]} > 0 )); then
-        echo -e "\033[1;31m⚠ Updates available: ${_updates[*]}\033[0m"
-        # Handle prompt only if running in an interactive terminal
-        if [[ -t 0 ]]; then
-            UPDATE_TIMEOUT="${LLM_SERVER_UPDATE_TIMEOUT:-30}"
-            read -r -t "$UPDATE_TIMEOUT" -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
-        else
-            _answer=""
-        fi
-
-        case "${_answer,,}" in
-            y)
-                echo "Running update..."
-                "$LAUNCHER" --update
-                echo ""
-                ;;
-            d)
-                mkdir -p "$CACHE_DIR"
-                date +%s > "$UPDATE_DISMISS_FILE"
-                echo "  Dismissed for ${UPDATE_DISMISS_DAYS} days."
-                ;;
-            *)
-                if [[ -t 0 ]]; then
-                    echo "  Update skipped due to timeout or user input."
-                else
-                    echo "  Non-interactive mode: skipping update prompt."
-                fi
-                ;;
-        esac
-        echo ""
+if (( ${#_updates[@]} > 0 )); then
+    echo -e "\033[1;31m═══════════════════════════════════════════════════════════════════════\033[0m"
+    echo -e "\033[1;31m⚠ UPDATE AVAILABLE: ${_updates[*]}\033[0m"
+    echo -e "\033[1;31mPlease choose an action. The GUI will not launch until you respond.\033[0m"
+    echo -e "\033[1;31m═══════════════════════════════════════════════════════════════════════\033[0m"
+    # Handle prompt only if running in an interactive terminal
+    if [[ -t 0 ]]; then
+        UPDATE_TIMEOUT="${LLM_SERVER_UPDATE_TIMEOUT:-300}"
+        read -r -p "  Update now? [y=Update / n=Skip / d=Dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty || _answer="n"
+    else
+        _answer="n"
     fi
+
+    case "${_answer,,}" in
+        y)
+            echo "Running update..."
+            "$LAUNCHER" --update
+            echo ""
+            ;;
+        d)
+            mkdir -p "$CACHE_DIR"
+            date +%s > "$UPDATE_DISMISS_FILE"
+            echo "  Dismissed for ${UPDATE_DISMISS_DAYS} days."
+            ;;
+        *)
+            echo "  Update skipped."
+            ;;
+    esac
+    echo ""
+fi
 fi
 export LLM_SERVER_UPDATE_CHECKED=1
 
