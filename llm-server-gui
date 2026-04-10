@@ -65,13 +65,16 @@ UPDATE_DISMISS_DAYS=7
 _check_repo_behind() {
     local repo_dir="$1" label="$2"
     [[ -d "$repo_dir/.git" ]] || return 1
-    git -C "$repo_dir" remote update --prune >/dev/null 2>&1 &
+    # Fetch latest from origin
+    git -C "$repo_dir" fetch origin --quiet 2>/dev/null &
     local fetch_pid=$!
-    ( sleep 5; kill "$fetch_pid" 2>/dev/null ) &
-    wait "$fetch_pid" 2>/dev/null || return 1
+    ( sleep 3; kill "$fetch_pid" 2>/dev/null ) &
+    wait "$fetch_pid" 2>/dev/null || true
+    
     local local_head remote_head
     local_head=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null) || return 1
-    remote_head=$(git -C "$repo_dir" rev-parse '@{u}' 2>/dev/null) || return 1
+    # Try origin/main first, then origin/master
+    remote_head=$(git -C "$repo_dir" rev-parse origin/main 2>/dev/null) || remote_head=$(git -C "$repo_dir" rev-parse origin/master 2>/dev/null) || return 1
     [[ "$local_head" != "$remote_head" ]] && echo "$label" && return 0
     return 1
 }
@@ -99,7 +102,16 @@ if _should_check_updates && [[ -d "$LLM_SERVER_REPO/.git" ]]; then
         echo "═══ Updates Available ═══"
         echo "  ⚠ ${_updates[*]}"
         echo ""
-        read -r -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        # Try to get input - prefer /dev/tty if available, else use stdin
+        if [[ -t 0 ]] || [[ -t 1 ]]; then
+            # Terminal mode - use stdin directly
+            read -r -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer
+        else
+            # Pipe mode - try tty, if fail use echo as fallback
+            _answer=$(echo "" | head -1)  # Just skip for piped input
+            echo "  (skipped in piped mode - run in terminal for interactive update)"
+            _answer="n"
+        fi
         case "${_answer,,}" in
             y)
                 echo "  Running --update..."
@@ -284,12 +296,7 @@ print_opts() {
     (( opt_vision )) && v="ON"
     (( opt_opencode )) && o="ON"
     (( opt_dryrun )) && d="ON"
-    
-    if (( opt_aitune )); then
-        printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s  [r] Rounds: %d\r" "$a" "$b" "$v" "$o" "$d" "$opt_rounds"
-    else
-        printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$o" "$d"
-    fi
+    printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$o" "$d"
 }
 print_opts
 while true; do
@@ -300,19 +307,6 @@ while true; do
         v|V) (( opt_vision = !opt_vision )) || true ;;
         o|O) (( opt_opencode = !opt_opencode )) || true ;;
         d|D) (( opt_dryrun = !opt_dryrun )) || true ;;
-        r|R)
-            if (( opt_aitune )); then
-                read -p "  Rounds (1-20): " new_rounds
-                opt_rounds=${new_rounds:-8}
-                [[ ! "$opt_rounds" =~ ^[0-9]+$ ]] && opt_rounds=8
-                (( opt_rounds < 1 )) && opt_rounds=1
-                (( opt_rounds > 20 )) && opt_rounds=20
-            else
-                # Show hint that AI Tune must be on first
-                printf "\r  Press 'a' to enable AI Tune first, then 'r' to set rounds.\r"
-                sleep 1.5
-            fi
-            ;;
         "") break ;;
         *) continue ;;
     esac
@@ -320,6 +314,18 @@ while true; do
     print_opts
 done
 echo ""
+
+# After options, if AI Tune is on, ask for rounds in a new "window"
+if (( opt_aitune )); then
+    echo "═══ AI Tune Options ═══"
+    read -p "  Number of rounds (1-20, default 8): " new_rounds
+    opt_rounds=${new_rounds:-8}
+    [[ ! "$opt_rounds" =~ ^[0-9]+$ ]] && opt_rounds=8
+    (( opt_rounds < 1 )) && opt_rounds=1
+    (( opt_rounds > 20 )) && opt_rounds=20
+    echo "  Rounds set to: $opt_rounds"
+    echo ""
+fi
 
 (( opt_aitune )) && OPT_FLAGS+=(--ai-tune)
 (( opt_aitune && opt_rounds != 8 )) && OPT_FLAGS+=(--rounds "$opt_rounds")

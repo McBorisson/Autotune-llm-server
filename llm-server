@@ -650,7 +650,12 @@ if [[ -z "${LLM_SERVER_UPDATE_CHECKED:-}" ]] && _should_check_updates; then
 
     if (( ${#_updates[@]} > 0 )); then
         echo -e "\033[1;31m⚠ Updates available: ${_updates[*]}\033[0m"
-        read -r -t 15 -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        if [[ -t 0 ]] || [[ -t 1 ]]; then
+            read -r -t 15 -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer
+        else
+            echo "  (skipped in non-interactive mode - run directly to update)"
+            _answer="n"
+        fi
         case "${_answer,,}" in
             y)
                 echo "Running --update..."
