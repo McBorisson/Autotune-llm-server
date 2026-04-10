@@ -39,14 +39,84 @@ mkdir -p "$CONFIG_DIR"
 
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 SPECIFIC_MODEL=""
+
+# Backend preference (ik_llama or llama)
+PREFERRED_BACKEND="${LLM_BACKEND:-llama}"  # default to llama
+
 # Auto-detect platform and use correct launcher
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LAUNCHER="$SCRIPT_DIR/llm-server-mac"
-    # Fallback to llm-server if mac version doesn't exist (e.g. symlinked)
     [[ ! -x "$LAUNCHER" ]] && LAUNCHER="$SCRIPT_DIR/llm-server"
 else
     LAUNCHER="$SCRIPT_DIR/llm-server"
+fi
+
+# Check if backends exist
+IK_BACKEND="$HOME/ik_llama.cpp/build/bin/llama-server"
+LLAMA_BACKEND="$HOME/llama.cpp/build/bin/llama-server"
+
+# Check for updates (same logic as llm-server - works in GUI too with TTY)
+LLM_SERVER_REPO="${LLM_SERVER_REPO:-$HOME/llm-server}"
+CACHE_DIR="$HOME/.cache/llm-server"
+UPDATE_DISMISS_FILE="$CACHE_DIR/update_dismissed"
+UPDATE_DISMISS_DAYS=7
+
+_check_repo_behind() {
+    local repo_dir="$1" label="$2"
+    [[ -d "$repo_dir/.git" ]] || return 1
+    git -C "$repo_dir" remote update --prune >/dev/null 2>&1 &
+    local fetch_pid=$!
+    ( sleep 5; kill "$fetch_pid" 2>/dev/null ) &
+    wait "$fetch_pid" 2>/dev/null || return 1
+    local local_head remote_head
+    local_head=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null) || return 1
+    remote_head=$(git -C "$repo_dir" rev-parse '@{u}' 2>/dev/null) || return 1
+    [[ "$local_head" != "$remote_head" ]] && echo "$label" && return 0
+    return 1
+}
+
+_should_check_updates() {
+    if [[ -f "$UPDATE_DISMISS_FILE" ]]; then
+        local dismissed_at
+        dismissed_at=$(cat "$UPDATE_DISMISS_FILE" 2>/dev/null)
+        local now
+        now=$(date +%s)
+        if (( now - dismissed_at < UPDATE_DISMISS_DAYS * 86400 )); then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+if _should_check_updates && [[ -d "$LLM_SERVER_REPO/.git" ]]; then
+    _updates=()
+    _check_repo_behind "$LLM_SERVER_REPO" "llm-server" && _updates+=("llm-server")
+    [[ -x "$IK_BACKEND" ]] && _check_repo_behind "$HOME/ik_llama.cpp" "ik_llama.cpp" && _updates+=("ik_llama.cpp")
+    [[ -x "$LLAMA_BACKEND" ]] && _check_repo_behind "$HOME/llama.cpp" "llama.cpp" && _updates+=("llama.cpp")
+
+    if (( ${#_updates[@]} > 0 )); then
+        echo "═══ Updates Available ═══"
+        echo "  ⚠ ${_updates[*]}"
+        echo ""
+        read -r -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        case "${_answer,,}" in
+            y)
+                echo "  Running --update..."
+                exec "$SCRIPT_DIR/llm-server" --update
+                ;;
+            d)
+                mkdir -p "$CACHE_DIR"
+                date +%s > "$UPDATE_DISMISS_FILE"
+                echo "  Dismissed for ${UPDATE_DISMISS_DAYS} days."
+                echo ""
+                ;;
+            *)
+                echo "  Skipped."
+                echo ""
+                ;;
+        esac
+    fi
 fi
 
 # Help flag
@@ -103,6 +173,45 @@ if [[ ! -x "$LAUNCHER" ]]; then
     echo "Error: llm-server not found at $LAUNCHER"
     exit 1
 fi
+
+# Backend selection
+echo "═══ Select Backend ═══"
+echo "  [1] llama.cpp       — better stability (recommended for production)"
+echo "  [2] ik_llama.cpp   — better performance (experimental features)"
+echo ""
+ik_avail=0; llama_avail=0
+[[ -x "$IK_BACKEND" ]] && ik_avail=1
+[[ -x "$LLAMA_BACKEND" ]] && llama_avail=1
+
+# If only one is available, auto-select
+backend_choice=1
+if (( ik_avail )) && (( ! llama_avail )); then
+    backend_choice=2
+elif (( ! ik_avail )) && (( llama_avail )); then
+    backend_choice=1
+else
+    read -p "Choice [1]: " backend_choice
+    backend_choice=${backend_choice:-1}
+fi
+
+if (( backend_choice == 2 )) && (( ik_avail )); then
+    PREFERRED_BACKEND="ik_llama"
+    # Save preference to config
+    if grep -q "LLM_BACKEND" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|LLM_BACKEND=.*|LLM_BACKEND=\"ik_llama\"|" "$CONFIG_FILE"
+    else
+        echo 'LLM_BACKEND="ik_llama"' >> "$CONFIG_FILE"
+    fi
+else
+    PREFERRED_BACKEND="llama"
+    if grep -q "LLM_BACKEND" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i 's|LLM_BACKEND=.*|LLM_BACKEND="llama"|' "$CONFIG_FILE"
+    else
+        echo 'LLM_BACKEND="llama"' >> "$CONFIG_FILE"
+    fi
+fi
+echo "  Using: $PREFERRED_BACKEND"
+echo ""
 
 # Find GGUF models (show first file of split GGUFs, skip duplicates)
 declare -a MODEL_PATHS MODEL_DISPLAY
@@ -167,6 +276,7 @@ echo ""
 OPT_FLAGS=()
 echo "Options (toggle with letter, Enter to launch):"
 opt_aitune=0; opt_bench=0; opt_vision=0; opt_opencode=0; opt_dryrun=0
+opt_rounds=8  # default rounds for AI Tune
 print_opts() {
     local a="off" b="off" v="off" o="off" d="off"
     (( opt_aitune )) && a="ON"
@@ -174,7 +284,12 @@ print_opts() {
     (( opt_vision )) && v="ON"
     (( opt_opencode )) && o="ON"
     (( opt_dryrun )) && d="ON"
-    printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$o" "$d"
+    
+    if (( opt_aitune )); then
+        printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s  [r] Rounds: %d\r" "$a" "$b" "$v" "$o" "$d" "$opt_rounds"
+    else
+        printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$o" "$d"
+    fi
 }
 print_opts
 while true; do
@@ -185,6 +300,19 @@ while true; do
         v|V) (( opt_vision = !opt_vision )) || true ;;
         o|O) (( opt_opencode = !opt_opencode )) || true ;;
         d|D) (( opt_dryrun = !opt_dryrun )) || true ;;
+        r|R)
+            if (( opt_aitune )); then
+                read -p "  Rounds (1-20): " new_rounds
+                opt_rounds=${new_rounds:-8}
+                [[ ! "$opt_rounds" =~ ^[0-9]+$ ]] && opt_rounds=8
+                (( opt_rounds < 1 )) && opt_rounds=1
+                (( opt_rounds > 20 )) && opt_rounds=20
+            else
+                # Show hint that AI Tune must be on first
+                printf "\r  Press 'a' to enable AI Tune first, then 'r' to set rounds.\r"
+                sleep 1.5
+            fi
+            ;;
         "") break ;;
         *) continue ;;
     esac
@@ -194,6 +322,7 @@ done
 echo ""
 
 (( opt_aitune )) && OPT_FLAGS+=(--ai-tune)
+(( opt_aitune && opt_rounds != 8 )) && OPT_FLAGS+=(--rounds "$opt_rounds")
 (( opt_bench )) && OPT_FLAGS+=(--benchmark)
 (( opt_vision )) && OPT_FLAGS+=(--vision)
 (( opt_opencode )) && OPT_FLAGS+=(--opencode)
@@ -202,4 +331,11 @@ echo ""
 echo "Launching: $(basename "$SELECTED") ${OPT_FLAGS[*]:-}"
 echo ""
 
-exec "$LAUNCHER" "${PASSTHROUGH_ARGS[@]}" "${OPT_FLAGS[@]+"${OPT_FLAGS[@]}"}" "$SELECTED"
+# Add server-bin based on backend preference
+if [[ "$PREFERRED_BACKEND" == "ik_llama" ]]; then
+    SERVER_BIN_FLAG=(--server-bin "$IK_BACKEND")
+else
+    SERVER_BIN_FLAG=(--server-bin "$LLAMA_BACKEND")
+fi
+
+exec "$LAUNCHER" "${SERVER_BIN_FLAG[@]}" "${PASSTHROUGH_ARGS[@]}" "${OPT_FLAGS[@]+"${OPT_FLAGS[@]}"}" "$SELECTED"
