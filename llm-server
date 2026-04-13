@@ -44,7 +44,10 @@ HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
 
 # Tuning constants
-MAX_RESTARTS=5
+# MAX_RESTARTS: give-up threshold for repeated startup failures.
+# Override with --keep-alive (or LLM_KEEP_ALIVE=1) to never give up.
+MAX_RESTARTS="${LLM_MAX_RESTARTS:-5}"
+KEEP_ALIVE="${LLM_KEEP_ALIVE:-0}"
 SYSTEM_HEADROOM_MB=5120          # RAM reserved for OS/system
 COMPUTE_PER_GPU_MB=512           # CUDA context + compute buffers per GPU
 MIN_CRAM_MB=512                  # minimum useful CPU RAM for expert offload
@@ -185,7 +188,9 @@ while [[ $# -gt 0 ]]; do
         --download)  DOWNLOAD=1; shift ;;
         --update)    DO_UPDATE=1; shift ;;
         --ai-tune)   DO_AI_TUNE=1; shift ;;
+        --tune-long-timeout) TUNE_LONG_TIMEOUT=1; shift ;;
         --rounds)    USER_TUNE_ROUNDS="$2"; shift 2 ;;
+        --keep-alive) KEEP_ALIVE=1; shift ;;
         --version)     echo "llm-server v$VERSION"; exit 0 ;;
         --help|-h)
             sed -n '3,/^$/s/^# \?//p' "$0"
@@ -1694,7 +1699,16 @@ run_with_restart() {
         echo ""
 
         if (( restarts > MAX_RESTARTS )); then
+            if (( KEEP_ALIVE )); then
+                echo "Reached $MAX_RESTARTS restarts, but --keep-alive set — continuing."
+                echo "Backoff extended to 60s between attempts. Ctrl-C to stop."
+                restarts=0
+                sleep 60
+                kill_server ""
+                continue
+            fi
             echo "Too many restarts ($MAX_RESTARTS). Giving up."
+            echo "Use --keep-alive (or LLM_KEEP_ALIVE=1) to never give up."
             echo "Check $SERVER_LOG for details."
             exit 1
         fi
@@ -2466,6 +2480,33 @@ print(json.dumps(msgs))
         echo "  AI Tune complete: baseline wins"
         echo "  The heuristic config is already optimal (${baseline_gen} tok/s)"
         echo "═══════════════════════════════════════════════════"
+
+        # Save a marker cache so future --ai-tune runs detect "already tuned"
+        # best_config.flags is empty → load_tune_cache returns 1 and COMMON_FLAGS
+        # is unchanged (which is exactly what "baseline wins" means).
+        python3 -c "
+import json
+from datetime import datetime
+cache = {
+    'model': '${MODEL_NAME}',
+    'tuned_at': datetime.utcnow().isoformat() + 'Z',
+    'provider': 'self',
+    'baseline_gen_tps': ${baseline_gen},
+    'baseline_pp_tps': ${baseline_pp},
+    'baseline_wins': True,
+    'best_config': {
+        'name': 'baseline',
+        'flags': {},
+        'gen_tps': ${baseline_gen},
+        'pp_tps': ${baseline_pp},
+    },
+    'rounds': ${AI_TUNE_ROUNDS},
+    'all_results': json.loads(open('/dev/stdin').read())
+}
+with open('${tune_cache}', 'w') as f:
+    json.dump(cache, f, indent=2)
+print(f'  Saved marker to: ${tune_cache}')
+" <<< "$all_results"
     else
         local total_improvement
         total_improvement=$(python3 -c "g=${baseline_gen}; print(f'{(${best_gen}-g)/g*100:.1f}' if g>0 else '0')")
@@ -2549,6 +2590,18 @@ d = json.load(open('$tune_cache'))
 b = d.get('best_config', {})
 print(f'  Expected: gen={b.get(\"gen_tps\", \"?\")} tok/s  pp={b.get(\"pp_tps\", \"?\")} tok/s')" 2>/dev/null
             return 0
+        else
+            # baseline-wins marker: no overrides to apply, but note it was tuned
+            local is_baseline_wins
+            is_baseline_wins=$(python3 -c "
+import json
+try:
+    d = json.load(open('$tune_cache'))
+    print('1' if d.get('baseline_wins') else '0')
+except: print('0')" 2>/dev/null)
+            if [[ "$is_baseline_wins" == "1" ]]; then
+                echo "  (baseline already optimal — no override flags needed)"
+            fi
         fi
     fi
     return 1

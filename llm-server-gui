@@ -236,15 +236,16 @@ echo ""
 # Option toggles (skip with Enter)
 OPT_FLAGS=()
 echo "Options (toggle with letter, Enter to launch):"
-opt_aitune=0; opt_bench=0; opt_vision=0; opt_opencode=0; opt_dryrun=0
+opt_aitune=0; opt_bench=0; opt_vision=0; opt_opencode=0; opt_dryrun=0; opt_keepalive=0
 print_opts() {
-    local a="off" b="off" v="off" o="off" d="off"
+    local a="off" b="off" v="off" o="off" d="off" k="off"
     (( opt_aitune )) && a="ON"
     (( opt_bench )) && b="ON"
     (( opt_vision )) && v="ON"
     (( opt_opencode )) && o="ON"
     (( opt_dryrun )) && d="ON"
-    printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$o" "$d"
+    (( opt_keepalive )) && k="ON"
+    printf "  [a] AI Tune %-3s  [b] Bench %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] DryRun %-3s  [k] KeepAlive %-3s\r" "$a" "$b" "$v" "$o" "$d" "$k"
 }
 print_opts
 while true; do
@@ -255,10 +256,11 @@ while true; do
         v|V) (( opt_vision = !opt_vision )) || true ;;
         o|O) (( opt_opencode = !opt_opencode )) || true ;;
         d|D) (( opt_dryrun = !opt_dryrun )) || true ;;
+        k|K) (( opt_keepalive = !opt_keepalive )) || true ;;
         "") break ;;
         *) continue ;;
     esac
-    printf "\r%100s\r" ""
+    printf "\r%150s\r" ""
     print_opts
 done
 echo ""
@@ -268,6 +270,7 @@ echo ""
 (( opt_vision )) && OPT_FLAGS+=(--vision)
 (( opt_opencode )) && OPT_FLAGS+=(--opencode)
 (( opt_dryrun )) && OPT_FLAGS+=(--dry-run)
+(( opt_keepalive )) && OPT_FLAGS+=(--keep-alive)
 
 echo "Launching: $(basename "$SELECTED") ${OPT_FLAGS[*]:-}"
 echo ""
