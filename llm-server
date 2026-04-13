@@ -15,6 +15,8 @@
 #   llm-server <model.gguf> --cpu        # Force CPU-only (ignore GPUs)
 #   llm-server <model.gguf> --server-bin /path/to/llama-server
 #   llm-server <model.gguf> --lib-path /path/to/libs
+#   llm-server <model.gguf> --backend llama   # force llama.cpp
+#   llm-server <model.gguf> --backend ik_llama # force ik_llama.cpp
 #   llm-server <model.gguf> --kv-quality high  # KV cache: high(f16), mid(q8_0), low(q4_0)
 #   llm-server <model.gguf> --gpus 0,1         # Use only GPU 0 and 1
 #   llm-server <model.gguf> --ram-budget 60G   # Cap RAM usage at 60GB
@@ -25,6 +27,7 @@
 #   llm-server <model.gguf> --mmproj proj.gguf # Enable vision with specific mmproj file
 #   llm-server <model.gguf> --ai-tune          # AI-driven flag optimization (8 rounds)
 #   llm-server <model.gguf> --ai-tune --retune # Force re-tune even if cache exists
+#   llm-server <model.gguf> --ai-tune --rounds 4 # Customize number of rounds
 #
 # Environment variables:
 #   LLAMA_SERVER    Path to llama-server binary (auto-detected if not set)
@@ -48,6 +51,7 @@ CTX_SIZE="${LLM_CTX_SIZE:-65536}"
 # Override with --keep-alive (or LLM_KEEP_ALIVE=1) to never give up.
 MAX_RESTARTS="${LLM_MAX_RESTARTS:-5}"
 KEEP_ALIVE="${LLM_KEEP_ALIVE:-0}"
+TUNE_LONG_TIMEOUT=0
 SYSTEM_HEADROOM_MB=5120          # RAM reserved for OS/system
 COMPUTE_PER_GPU_MB=512           # CUDA context + compute buffers per GPU
 MIN_CRAM_MB=512                  # minimum useful CPU RAM for expert offload
@@ -69,6 +73,7 @@ SERVER_LOG="/tmp/llm-server.log"
 LIB_HUB_DIR=""
 
 RETUNE=0
+USER_TUNE_ROUNDS=""
 DOWNLOAD=0
 DRY_RUN=0
 VERBOSE=0
@@ -84,6 +89,7 @@ MMPROJ_PATH=""
 DO_UPDATE=0
 DO_AI_TUNE=0
 START_OPENCODE=0
+BACKEND=""  # "llama" or "ik_llama" - empty = auto-detect
 
 # Ensure common local paths are in PATH for sub-scripts (OpenCode, etc.)
 export PATH="$HOME/.local/bin:$PATH"
@@ -143,28 +149,35 @@ find_server_binary() {
         echo "$LLAMA_SERVER"
         return
     fi
-    # Prefer ik_llama.cpp (faster multi-GPU)
-    local candidates=(
-        "$HOME/ik_llama.cpp/build/bin/llama-server"
-        "$HOME/llama.cpp/build/bin/llama-server"
-        "$(command -v llama-server 2>/dev/null || true)"
-    )
+    
+    local candidates=()
+    
+    # Respect --backend flag
+    if [[ "$BACKEND" == "ik_llama" ]]; then
+        candidates+=("$HOME/ik_llama.cpp/build/bin/llama-server")
+    elif [[ "$BACKEND" == "llama" ]]; then
+        candidates+=("$HOME/llama.cpp/build/bin/llama-server")
+    else
+        # Auto-detect: prefer ik_llama.cpp (faster multi-GPU)
+        candidates=(
+            "$HOME/ik_llama.cpp/build/bin/llama-server"
+            "$HOME/llama.cpp/build/bin/llama-server"
+        )
+    fi
+    
+    # Also check PATH
+    candidates+=("$(command -v llama-server 2>/dev/null || true)")
+    
     for bin in "${candidates[@]}"; do
         [[ -n "$bin" && -x "$bin" ]] && echo "$bin" && return
     done
     echo ""
 }
 
-LLAMA_SERVER="$(find_server_binary)"
-
-# Initial lib hub setup
-if [[ -n "$LLAMA_SERVER" ]]; then
-    setup_lib_hub "$LLAMA_SERVER"
-fi
-
-# Note: --server-bin and --lib-path are applied after arg parsing (see below)
-
 # Parse arguments
+# ─────────────────────────────────────────────────────────────────
+# Create a copy of args to allow re-parsing if needed, though we unify here
+ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --retune)    RETUNE=1; shift ;;
@@ -172,16 +185,16 @@ while [[ $# -gt 0 ]]; do
         --verbose)   VERBOSE=1; shift ;;
         --benchmark) BENCHMARK=1; shift ;;
         --cpu)       CPU_ONLY=1; shift ;;
+        --model-dir) MODEL_DIR="$2"; shift 2 ;;
         --port)      PORT="$2"; shift 2 ;;
         --ctx-size)  CTX_SIZE="$2"; shift 2 ;;
-        --model-dir)   MODEL_DIR="$2"; shift 2 ;;
-        --server-bin)  USER_SERVER_BIN="$2"; shift 2 ;;
-        --lib-path)    USER_LIB_PATH="$2"; shift 2 ;;
+        --server-bin) USER_SERVER_BIN="$2"; shift 2 ;;
+        --lib-path)   USER_LIB_PATH="$2"; shift 2 ;;
         --kv-quality)
-            case "$2" in high|mid|low) ;; *) echo "Error: --kv-quality must be one of: high, mid, low"; exit 1 ;; esac
+            case "${2:-}" in high|mid|low) ;; *) echo "Error: --kv-quality must be one of: high, mid, low"; exit 1 ;; esac
             KV_QUALITY="$2"; shift 2 ;;
-        --gpus)        GPUS_FILTER="$2"; shift 2 ;;
-        --ram-budget)  RAM_BUDGET_MB="$2"; shift 2 ;;
+        --gpus)      GPUS_FILTER="$2"; shift 2 ;;
+        --ram-budget) RAM_BUDGET_MB="$2"; shift 2 ;;
         --mmproj)      MMPROJ_PATH="$2"; shift 2 ;;
         --vision)      MMPROJ_PATH="auto"; shift ;;  # alias: auto-detect/download mmproj
         --opencode)    START_OPENCODE=1; shift ;;
@@ -191,6 +204,7 @@ while [[ $# -gt 0 ]]; do
         --tune-long-timeout) TUNE_LONG_TIMEOUT=1; shift ;;
         --rounds)    USER_TUNE_ROUNDS="$2"; shift 2 ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
+        --backend)   BACKEND="$2"; shift 2 ;;
         --version)     echo "llm-server v$VERSION"; exit 0 ;;
         --help|-h)
             sed -n '3,/^$/s/^# \?//p' "$0"
@@ -199,6 +213,14 @@ while [[ $# -gt 0 ]]; do
         *)           MODEL_ARG="$1"; shift ;;
     esac
 done
+
+# Now find the binary (BACKEND is now set from args)
+LLAMA_SERVER="$(find_server_binary)"
+
+# Initial lib hub setup
+if [[ -n "$LLAMA_SERVER" ]]; then
+    setup_lib_hub "$LLAMA_SERVER"
+fi
 
 # Parse --ram-budget human units (e.g. "60G" → 61440 MB)
 if [[ -n "$RAM_BUDGET_MB" && "$RAM_BUDGET_MB" != "0" ]]; then
@@ -264,34 +286,60 @@ fi
 # ── Update Logic ──
 if (( DO_UPDATE )); then
 
-    # Self-update: pull latest llm-server from git, re-install
+    # Self-update: pull latest llm-server from git, re-install with rollback
     LLM_SERVER_REPO="${LLM_SERVER_REPO:-$HOME/llm-server}"
     if [[ -d "$LLM_SERVER_REPO/.git" ]]; then
         echo "═══ Updating llm-server ═══"
         pushd "$LLM_SERVER_REPO" > /dev/null
-        old_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+        local old_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+        
+        # Save current script state for potential rollback
+        local script_path
+        script_path=$(readlink -f "$0")
+        local script_backup="${script_path}.bak"
+        cp "$script_path" "$script_backup"
+
         if git pull --ff-only 2>&1 | tail -3; then
-            new_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+            local new_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
             if [[ "$old_hash" != "$new_hash" ]]; then
                 echo "  Updated: $(git log --oneline "${old_hash}..${new_hash}" | wc -l) new commits"
                 git log --oneline "${old_hash}..${new_hash}" | head -5 | sed 's/^/    /'
+                
                 # Re-install updated scripts
                 if [[ -x "./install.sh" ]]; then
                     echo "  Re-installing..."
-                    bash ./install.sh
+                    if ! bash ./install.sh > /dev/null 2>&1; then
+                        echo "  Error: Install failed. Rolling back script content..."
+                        git checkout "$old_hash" 2>/dev/null
+                        cp "$script_backup" "$script_path"
+                        rm -f "$script_backup"
+                        popd > /dev/null
+                        return 1
+                    fi
                 fi
-                echo ""
-                echo "  ✓ llm-server updated. Restart to use the new version."
+
+                # Quick self-check: can the new script run --version?
+                if ! "$script_path" --version > /dev/null 2>&1; then
+                    echo "  Error: New version failed self-check. Rolling back..."
+                    git checkout "$old_hash" 2>/dev/null
+                    cp "$script_backup" "$script_path"
+                    # Re-run install to restore previous versions of other tools
+                    [[ -x "./install.sh" ]] && bash ./install.sh > /dev/null 2>&1
+                    echo "  Rolled back to $old_hash"
+                else
+                    echo ""
+                    echo "  ✓ llm-server updated and verified. Restart to use the new version."
+                fi
             else
                 echo "  Already up to date."
             fi
         else
-            echo "  Warning: git pull failed. Continuing with backend updates..."
+            echo "  Warning: git pull failed (unclean repo?). Skipping self-update."
         fi
+        rm -f "$script_backup"
         popd > /dev/null
     else
         echo "Info: llm-server repo not found at $LLM_SERVER_REPO — skipping self-update."
-        echo "  Set LLM_SERVER_REPO=/path/to/llm-server to enable self-update."
     fi
     echo ""
 
@@ -386,6 +434,32 @@ if (( DO_UPDATE )); then
             [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
             echo "  Rolled back to $old_commit"
             return 1
+        fi
+
+        # Deep test: try loading a small model to verify it works
+        # Find any available model
+        local test_model=""
+        for f in ~/ai_models/*.gguf; do
+            if [[ -f "$f" ]]; then
+                test_model="$f"
+                break
+            fi
+        done
+
+        if [[ -n "$test_model" ]]; then
+            echo "  Testing model launch: $(basename "$test_model")"
+            # Try to load model briefly (timeout 30s, exit after load)
+            if timeout 30s "$binary" -m "$test_model" -- ctx-size 2048 -n 1 --parallel 1 2>&1 | grep -q "model loaded"; then
+                echo "  Model launch test: PASSED ✓"
+            else
+                echo "  Model launch test: FAILED — rolling back..."
+                git checkout "$old_commit" 2>/dev/null
+                [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
+                echo "  Rolled back to $old_commit"
+                return 1
+            fi
+        else
+            echo "  Skipping model test (no GGUF models found)"
         fi
 
         local new_binary_hash
@@ -538,8 +612,6 @@ if (( START_OPENCODE )); then
     exec >> "$SERVER_LOG" 2>&1
 fi
 
-echo "═══ llm-server v$VERSION ═══"
-
 # ── Update check ──
 # Checks llm-server repo + backends for available updates.
 # Dismiss file suppresses the check for 7 days.
@@ -588,7 +660,12 @@ if [[ -z "${LLM_SERVER_UPDATE_CHECKED:-}" ]] && _should_check_updates; then
 
     if (( ${#_updates[@]} > 0 )); then
         echo -e "\033[1;31m⚠ Updates available: ${_updates[*]}\033[0m"
-        read -r -t 15 -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        if [[ -t 0 ]] || [[ -t 1 ]]; then
+            read -r -t 15 -p "  Update now? [y/N/d=dismiss ${UPDATE_DISMISS_DAYS} days] " _answer < /dev/tty 2>/dev/null || _answer=""
+        else
+            echo "  (skipped in non-interactive mode - run directly to update)"
+            _answer="n"
+        fi
         case "${_answer,,}" in
             y)
                 echo "Running --update..."
@@ -604,7 +681,10 @@ if [[ -z "${LLM_SERVER_UPDATE_CHECKED:-}" ]] && _should_check_updates; then
                 ;;
         esac
     fi
+    export LLM_SERVER_UPDATE_CHECKED=1
 fi
+
+echo "═══ llm-server v$VERSION ═══"
 
 echo "Binary: $LLAMA_SERVER"
 (( IS_IK_LLAMA )) && echo "Backend: ik_llama.cpp (graph split enabled)"
