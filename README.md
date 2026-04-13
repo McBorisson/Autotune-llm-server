@@ -120,9 +120,11 @@ llm-server model.gguf
 - **Vision support** — `--vision` auto-detects and downloads the correct mmproj from HuggingFace. Also works with `--mmproj auto` or a specific path.
 - **Auto-update** — `--update` pulls latest ik_llama.cpp and llama.cpp, rebuilds with CUDA, and automatically rolls back if the new binary breaks.
 - **Auto-fallback** — if ik_llama.cpp can't load a model (unsupported architecture), automatically switches to mainline llama.cpp mid-launch.
-- **Crash recovery** — auto-restarts with backoff on runtime crashes, detects CUDA errors and image decode loops.
+- **Crash recovery** — auto-restarts with backoff on runtime crashes, detects CUDA errors and image decode loops. Use `--keep-alive` (or `LLM_KEEP_ALIVE=1`) for unattended deployments that must never go offline.
+- **Backend selection** — `--backend llama|ik_llama` forces a specific backend, overriding auto-detection. `llm-server-gui` exposes this as an interactive picker and remembers your choice in `~/.config/llm-server/config.sh`.
+- **Long-tune support** — `--tune-long-timeout` doubles per-round timeouts during `--ai-tune` for very large / slow-loading models.
 - **Benchmark mode** — `--benchmark` to measure tok/s and auto-exit after completion.
-- **Terminal GUI** — `llm-server-gui` for interactive model selection with option toggles.
+- **Terminal GUI** — `llm-server-gui` for interactive model selection with option toggles (`[a]` AI Tune, `[b]` Bench, `[v]` Vision, `[o]` OpenCode, `[d]` Dry Run, `[k]` Keep Alive).
 
 ## Install
 
@@ -170,7 +172,15 @@ llm-server unsloth/Qwen3.5-27B-GGUF --download
 llm-server --update
 
 # Force a specific backend
-llm-server --server-bin /path/to/llama-server model.gguf
+llm-server --backend llama model.gguf       # mainline llama.cpp
+llm-server --backend ik_llama model.gguf    # ik_llama.cpp
+llm-server --server-bin /path/to/llama-server model.gguf  # explicit binary path
+
+# Unattended / always-on — never give up on restart loop
+llm-server model.gguf --keep-alive
+
+# Slow/huge model tuning — doubles per-round timeouts
+llm-server huge-model.gguf --ai-tune --tune-long-timeout
 
 # Start and run a quick benchmark (auto-exits)
 llm-server --benchmark model.gguf
