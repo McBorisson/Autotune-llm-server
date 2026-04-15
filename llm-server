@@ -2168,13 +2168,17 @@ parse_tune_overrides() {
     TUNE_OVERRIDE_FLAGS=()
     local flags_str
     local kv_locked="$KV_QUALITY_EXPLICIT"
-    flags_str=$(KV_LOCKED="$kv_locked" python3 -c "
+    flags_str=$(KV_LOCKED="$kv_locked" WSL2="$IS_WSL2" python3 -c "
 import json, os, sys
 overrides = json.loads(sys.stdin.read())
 protected = {'-m', '--host', '--port', '--ctx-size', '-ot'}
 # User explicitly picked a KV quality — don't let AI-tune downgrade it
 if os.environ.get('KV_LOCKED') == '1':
     protected |= {'--cache-type-k', '--cache-type-v'}
+# On WSL2, --mlock pins guest memory into the Windows host and can freeze it.
+# Refuse any LLM proposal that tries to re-enable it.
+if os.environ.get('WSL2') == '1':
+    protected |= {'--mlock', '-mlk'}
 parts = []
 for k, v in overrides.items():
     if k in protected:
@@ -2365,6 +2369,13 @@ SYSEOF
     fi
     system_prompt="${system_prompt//\{unlimited_section\}/$unlimited_section}"
 
+    # WSL2-specific guardrails — on WSL2, --mlock can freeze the Windows host
+    # and the OOM killer is unreliable, so we tighten memory-aggressive tuning.
+    if (( IS_WSL2 )); then
+        local wsl2_note=$'\n# WSL2 environment — extra caution required\n- NEVER propose --mlock (causes host freeze; script will strip it if you try).\n- Host OOM killer is unreliable — prefer conservative batch/parallel values.\n- Headroom is tighter: stay at least 3GB below the system total.\n'
+        system_prompt="${system_prompt}${wsl2_note}"
+    fi
+
     # Build the initial user message with all context
     local initial_context
     initial_context=$(cat <<CTXEOF
@@ -2513,29 +2524,49 @@ msgs.append({'role': 'assistant', 'content': open('${tune_msg_dir}/resp_${round}
 print(json.dumps(msgs))
 " <<< "$messages")
 
-        # RAM safety check — will this config OOM the system?
-        # Uses total RAM (not available) since baseline is killed before test starts
-        # 5GB reserved for OS/other processes
+        # RAM/VRAM safety check — will this config OOM the system?
+        # Factors considered: KV cache type (f16/q8_0/q4_0), batch size (-b/-ub),
+        # parallel slot count (--parallel N multiplies KV + compute buffers).
+        # 5GB reserved for OS/other processes.
         local est_kv_mb=${KV_TOTAL_MB:-0}
-        local proposed_kv_k proposed_kv_v
+        local proposed_kv_k proposed_batch proposed_ubatch proposed_parallel
         proposed_kv_k=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('--cache-type-k',''))" 2>/dev/null) || true
-        proposed_kv_v=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('--cache-type-v',''))" 2>/dev/null) || true
-        if [[ -n "$proposed_kv_k" || -n "$proposed_kv_v" ]]; then
-            local kv_mult=1
-            case "${proposed_kv_k:-${KV_QUALITY:-q4_0}}" in
-                f16)  kv_mult=4 ;;
-                q8_0) kv_mult=2 ;;
-                q4_0) kv_mult=1 ;;
-            esac
-            est_kv_mb=$(( KV_TOTAL_MB * kv_mult ))
-        fi
-        local est_total_mb=$(( TOTAL_SIZE_MB + est_kv_mb + 2048 ))  # model + KV + batch buffers
+        proposed_batch=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('-b', d.get('--batch-size','')))" 2>/dev/null) || true
+        proposed_ubatch=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('-ub', d.get('--ubatch-size','')))" 2>/dev/null) || true
+        proposed_parallel=$(echo "$config_flags_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('--parallel', d.get('-np','')))" 2>/dev/null) || true
+
+        # KV multiplier from proposed cache type (falls back to current KV_QUALITY)
+        local kv_mult=1
+        case "${proposed_kv_k:-${KV_QUALITY:-q4_0}}" in
+            f16)  kv_mult=4 ;;
+            q8_0) kv_mult=2 ;;
+            q4_0) kv_mult=1 ;;
+        esac
+        est_kv_mb=$(( KV_TOTAL_MB * kv_mult ))
+
+        # --parallel multiplies KV cache allocation per slot
+        local parallel_slots=${proposed_parallel:-${PARALLEL_SLOTS:-4}}
+        [[ ! "$parallel_slots" =~ ^[0-9]+$ ]] && parallel_slots=4
+        (( parallel_slots < 1 )) && parallel_slots=1
+        est_kv_mb=$(( est_kv_mb * parallel_slots ))
+
+        # Compute buffer scales with batch size. Conservative estimate:
+        # ~0.5 MB per token of batch (model-dependent, err high).
+        local batch_sz=${proposed_batch:-${BATCH:-2048}}
+        [[ ! "$batch_sz" =~ ^[0-9]+$ ]] && batch_sz=2048
+        local est_compute_mb=$(( batch_sz / 2 ))
+        (( est_compute_mb < 512 )) && est_compute_mb=512
+
+        local est_total_mb=$(( TOTAL_SIZE_MB + est_kv_mb + est_compute_mb ))
         local total_ram_mb
         total_ram_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null) || total_ram_mb=${RAM_AVAIL_MB}
         local system_total_mb=$(( TOTAL_VRAM_MB + total_ram_mb - 5120 ))  # 5GB OS reserve
+        # Tighter reserve on WSL2 since host freeze is catastrophic and OOM killer is unreliable
+        (( IS_WSL2 )) && system_total_mb=$(( system_total_mb - 3072 ))
+
         if (( est_total_mb > system_total_mb )); then
             echo "  SKIPPED — estimated ${est_total_mb}MB > system capacity ${system_total_mb}MB (OOM protection)"
-            echo "Result for '${config_name}': SKIPPED — needs ~${est_total_mb}MB (model ${TOTAL_SIZE_MB}MB + KV ${est_kv_mb}MB) but system has ${system_total_mb}MB usable. Do NOT increase KV cache or batch. Try other flags." > "$tune_msg_dir/feedback_${round}.txt"
+            echo "Result for '${config_name}': SKIPPED — needs ~${est_total_mb}MB (model ${TOTAL_SIZE_MB}MB + KV ${est_kv_mb}MB [parallel=${parallel_slots}] + compute ${est_compute_mb}MB [batch=${batch_sz}]) but system has ${system_total_mb}MB usable. Do NOT increase KV cache, batch size, or parallel. Try other flags." > "$tune_msg_dir/feedback_${round}.txt"
             messages=$(python3 -c "
 import json, sys
 msgs = json.loads(sys.stdin.read())
