@@ -1315,61 +1315,6 @@ with open('$dest','rb') as f:
     return 1
 }
 
-if [[ "$MMPROJ_PATH" == "auto" ]]; then
-    echo "  Vision: auto-detecting mmproj..."
-    MMPROJ_PATH=$(find_local_mmproj)
-    if [[ -n "$MMPROJ_PATH" ]]; then
-        # Verify the local mmproj matches our model architecture
-        local_mmproj_arch=$(python3 -c "
-import struct, sys
-KV_FIXED = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
-try:
-    with open('$MMPROJ_PATH','rb') as f:
-        if f.read(4) != b'GGUF': sys.exit(1)
-        f.read(4); struct.unpack('<Q',f.read(8)); kvc=struct.unpack('<Q',f.read(8))[0]
-        for _ in range(kvc):
-            kl=struct.unpack('<Q',f.read(8))[0]; key=f.read(kl).decode('utf-8','replace')
-            vt=struct.unpack('<I',f.read(4))[0]
-            if vt==8:
-                sl=struct.unpack('<Q',f.read(8))[0]; val=f.read(sl).decode('utf-8','replace')
-                if key=='general.name': print(val); sys.exit(0)
-            elif vt==9:
-                at=struct.unpack('<I',f.read(4))[0]; al=struct.unpack('<Q',f.read(8))[0]
-                if at in KV_FIXED: f.read(al*KV_FIXED[at])
-                elif at==8:
-                    for _ in range(al): f.read(struct.unpack('<Q',f.read(8))[0])
-                else: break
-            elif vt in KV_FIXED: f.read(KV_FIXED[vt])
-            else: break
-except: pass
-print('unknown')
-" 2>/dev/null)
-        # Check if mmproj name contains our model name (loose match)
-        if [[ -n "$GGUF_MODEL_NAME" && "$local_mmproj_arch" != *"$GGUF_MODEL_NAME"* && "$GGUF_MODEL_NAME" != *"$local_mmproj_arch"* ]]; then
-            echo "  Warning: local mmproj is for '$local_mmproj_arch', model is '$GGUF_MODEL_NAME'"
-            echo "  Downloading correct mmproj instead..."
-            MMPROJ_PATH=""
-        else
-            echo "  Found local mmproj: $MMPROJ_PATH"
-        fi
-    fi
-    if [[ -z "$MMPROJ_PATH" ]]; then
-        MMPROJ_PATH=$(download_mmproj) || true
-        if [[ -z "$MMPROJ_PATH" ]]; then
-            echo "  Warning: could not find or download mmproj — vision disabled"
-            echo "  To fix: download mmproj-F16.gguf into $MODEL_DIR_PATH/"
-        fi
-    fi
-elif [[ -n "$MMPROJ_PATH" ]]; then
-    if [[ ! -f "$MMPROJ_PATH" ]]; then
-        if [[ -f "$MODEL_DIR/$MMPROJ_PATH" ]]; then
-            MMPROJ_PATH="$MODEL_DIR/$MMPROJ_PATH"
-        else
-            echo "Error: mmproj file not found: $MMPROJ_PATH"
-            exit 1
-        fi
-    fi
-fi
 if [[ -n "$MMPROJ_PATH" && -f "$MMPROJ_PATH" ]]; then
     COMMON_FLAGS+=(--mmproj "$MMPROJ_PATH")
     echo "  Vision: mmproj loaded from $MMPROJ_PATH"
@@ -1415,7 +1360,31 @@ check_memory_or_die() {
     fi
 }
 
+# ═══════════════════════════════════════════════════════════════
+# Section 4: Vision & Memory Budgeting
+# ═══════════════════════════════════════════════════════════════
+
+# First resolve Vision path (so we can include it in VRAM calculation)
+if [[ "$MMPROJ_PATH" == "auto" ]]; then
+    MMPROJ_PATH=$(find_local_mmproj)
+    if [[ -z "$MMPROJ_PATH" ]]; then
+        MMPROJ_PATH=$(download_mmproj) || true
+    fi
+fi
+
+# Calculate VRAM needed including mmproj
 VRAM_NEEDED_MB=$(( TOTAL_SIZE_MB * VRAM_OVERHEAD_PERCENT / 100 + KV_TOTAL_MB + COMPUTE_PER_GPU_MB ))
+if [[ -n "$MMPROJ_PATH" ]]; then
+    if [[ -f "$MMPROJ_PATH" ]]; then
+        MMPROJ_SIZE_MB=$(du -sm "$MMPROJ_PATH" | awk '{print $1}')
+        VRAM_NEEDED_MB=$(( VRAM_NEEDED_MB + MMPROJ_SIZE_MB ))
+    else
+        echo "Error: Vision enabled but mmproj file not found/downloaded."
+        echo "Please verify model path or use --ai-tune."
+        exit 1
+    fi
+fi
+
 
 # Global OOM check: model must fit somewhere (all GPUs + RAM combined)
 # Skip for MoE — expert offload has its own fine-grained budgeting (Phase 1+2)
@@ -1665,6 +1634,36 @@ run_with_restart() {
                 break
             fi
             if ! kill -0 "$pid" 2>/dev/null; then
+                # Server died, check if we need to fall back
+                if [[ "$LLAMA_SERVER" == *"/ik_llama.cpp/"* ]]; then
+                    echo ""
+                    echo "═══ ik_llama.cpp cannot load this model — falling back to mainline llama.cpp ═══"
+                    
+                    # Sanitize flags
+                    local new_flags=()
+                    local skip_next=0
+                    for f in "${flags[@]}"; do
+                        if (( skip_next )); then
+                            skip_next=0
+                            continue
+                        fi
+                        case "$f" in
+                            --run-time-repack|--defrag-thold|-cram|--ctx-checkpoints|-khad|-mqkv)
+                                echo "  Removing ik-only flag: $f"
+                                if [[ "$f" == "--defrag-thold" || "$f" == "-cram" || "$f" == "--ctx-checkpoints" ]]; then
+                                    skip_next=1
+                                fi
+                                continue ;;
+                            *) new_flags+=("$f") ;;
+                        esac
+                    done
+                    flags=("${new_flags[@]}")
+                    
+                    LLAMA_SERVER="$HOME/llama.cpp/build/bin/llama-server"
+                    echo "  Retrying with: $LLAMA_SERVER"
+                    # Restart the loop with new flags
+                    continue 2
+                fi
                 break
             fi
             sleep 1
@@ -2103,9 +2102,24 @@ except:
 # Build fixed flags string (these never change during tuning)
 build_fixed_flags() {
     local flags="-m \"${MODEL_PATH}\" --host \"${HOST}\" --port \"${PORT}\" --ctx-size \"${CTX_SIZE}\""
+    
+    # If not unlimited, all Stage 1 heuristic flags are "fixed" (baseline)
+    if (( !DO_UNLIMITED )); then
+        for f in "${COMMON_FLAGS[@]}"; do
+            # Avoid duplicating flags already in the base string
+            if [[ " $flags " != *" $f "* ]]; then
+                flags+=" $f"
+            fi
+        done
+    fi
+
     # Include MoE placement flags if set
     if (( ${#TUNE_EXTRA_FIXED[@]} > 0 )); then
-        flags+=" ${TUNE_EXTRA_FIXED[*]}"
+        for f in "${TUNE_EXTRA_FIXED[@]}"; do
+             if [[ " $flags " != *" $f "* ]]; then
+                flags+=" $f"
+            fi
+        done
     fi
     echo "$flags"
 }
@@ -2141,7 +2155,9 @@ print(' '.join(parts))
 # Main AI tune function — iterative: benchmark → query → benchmark → query ...
 ai_tune() {
     mkdir -p "$CACHE_DIR"
-    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
+    local vision_suffix=""
+    [[ -n "$MMPROJ_PATH" ]] && vision_suffix="_v"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}"
     local tune_cache_suffix=""
     (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
     local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
@@ -2658,7 +2674,9 @@ print(f'  Saved to: ${tune_cache}')
 # Load AI tune cache — merges tuned flag overrides with fixed flags
 load_tune_cache() {
     mkdir -p "$CACHE_DIR"
-    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
+    local vision_suffix=""
+    [[ -n "$MMPROJ_PATH" ]] && vision_suffix="_v"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}"
     local tune_cache_suffix=""
     (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
     local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
@@ -2743,7 +2761,8 @@ fi
 kill_server ""
 
 # If tune cache was loaded, launch directly with tuned flags (skip strategy logic)
-if (( TUNE_LOADED )); then
+# EXCEPT for MoE models, which must still go through Section 8 for expert placement
+if (( TUNE_LOADED )) && [[ "$STRATEGY" != "moe_offload" ]]; then
     if (( DRY_RUN )); then
         print_cmd "${COMMON_FLAGS[@]}"
         exit 0
