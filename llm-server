@@ -712,7 +712,7 @@ fi
 
 # Detect GPUs
 GPU_COUNT=0
-declare -a GPU_INDEX GPU_NAME GPU_VRAM_TOTAL GPU_VRAM_FREE GPU_PCIE_WIDTH GPU_PCIE_GEN GPU_BANDWIDTH
+declare -a GPU_INDEX GPU_NAME GPU_VRAM_TOTAL GPU_VRAM_FREE GPU_PCIE_WIDTH GPU_PCIE_GEN GPU_BANDWIDTH GPU_COMPUTE_CAP
 
 if (( CPU_ONLY )); then
     echo "GPUs: skipped (--cpu flag)"
@@ -727,6 +727,9 @@ elif command -v nvidia-smi &>/dev/null; then
         vram_free=$(echo "${fields[3]}" | tr -d ' ')
         pcie_width=$(echo "${fields[4]}" | tr -d ' ')
         pcie_gen=$(echo "${fields[5]}" | tr -d ' ')
+        # compute_cap is "8.6", "6.1", etc — may be absent on very old drivers
+        compute_cap=$(echo "${fields[6]:-0.0}" | tr -d ' ')
+        [[ -z "$compute_cap" || "$compute_cap" == "[N/A]" ]] && compute_cap="0.0"
 
         # Skip GPUs with less than 500MB free
         if (( vram_free < 500 )); then
@@ -739,16 +742,17 @@ elif command -v nvidia-smi &>/dev/null; then
         GPU_VRAM_FREE+=("$vram_free")
         GPU_PCIE_WIDTH+=("$pcie_width")
         GPU_PCIE_GEN+=("$pcie_gen")
+        GPU_COMPUTE_CAP+=("$compute_cap")
         # Effective bandwidth score: width * gen (higher = faster)
         GPU_BANDWIDTH+=( $(( pcie_width * pcie_gen )) )
         GPU_COUNT=$(( GPU_COUNT + 1 ))
-    done < <(nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.width.current,pcie.link.gen.current --format=csv,noheader,nounits 2>/dev/null)
+    done < <(nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.width.current,pcie.link.gen.current,compute_cap --format=csv,noheader,nounits 2>/dev/null)
 fi
 
 # Apply --gpus filter (restrict to specified CUDA indices)
 if [[ -n "$GPUS_FILTER" && $GPU_COUNT -gt 0 ]]; then
     IFS=',' read -ra ALLOWED_GPUS <<< "$GPUS_FILTER"
-    declare -a NEW_GPU_INDEX NEW_GPU_NAME NEW_GPU_VRAM_TOTAL NEW_GPU_VRAM_FREE NEW_GPU_PCIE_WIDTH NEW_GPU_PCIE_GEN NEW_GPU_BANDWIDTH
+    declare -a NEW_GPU_INDEX NEW_GPU_NAME NEW_GPU_VRAM_TOTAL NEW_GPU_VRAM_FREE NEW_GPU_PCIE_WIDTH NEW_GPU_PCIE_GEN NEW_GPU_BANDWIDTH NEW_GPU_COMPUTE_CAP
     NEW_GPU_COUNT=0
     for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
         for allowed in "${ALLOWED_GPUS[@]}"; do
@@ -760,6 +764,7 @@ if [[ -n "$GPUS_FILTER" && $GPU_COUNT -gt 0 ]]; then
                 NEW_GPU_PCIE_WIDTH+=("${GPU_PCIE_WIDTH[$i]}")
                 NEW_GPU_PCIE_GEN+=("${GPU_PCIE_GEN[$i]}")
                 NEW_GPU_BANDWIDTH+=("${GPU_BANDWIDTH[$i]}")
+                NEW_GPU_COMPUTE_CAP+=("${GPU_COMPUTE_CAP[$i]}")
                 (( NEW_GPU_COUNT++ )) || true
                 break
             fi
@@ -776,6 +781,7 @@ if [[ -n "$GPUS_FILTER" && $GPU_COUNT -gt 0 ]]; then
     GPU_PCIE_WIDTH=("${NEW_GPU_PCIE_WIDTH[@]}")
     GPU_PCIE_GEN=("${NEW_GPU_PCIE_GEN[@]}")
     GPU_BANDWIDTH=("${NEW_GPU_BANDWIDTH[@]}")
+    GPU_COMPUTE_CAP=("${NEW_GPU_COMPUTE_CAP[@]}")
     GPU_COUNT=$NEW_GPU_COUNT
     echo "GPU filter: using only GPU(s) $GPUS_FILTER ($GPU_COUNT matched)"
 fi
@@ -784,12 +790,17 @@ if (( GPU_COUNT == 0 )); then
     echo "GPUs: none detected (CPU-only mode)"
 else
     echo "GPUs: $GPU_COUNT detected"
-    # Sort GPUs by bandwidth (descending) — build priority order
+    # Sort GPUs by bandwidth DESC, then VRAM_TOTAL DESC, then compute_cap DESC.
+    # Tiebreakers matter on heterogeneous rigs where PCIe bandwidth ties
+    # (e.g. 3080 Ti + 1080 Ti both at x8 gen1) — without them, nvidia-smi
+    # order wins and we can pick the slower card for single_gpu strategy.
     declare -a GPU_ORDER
     GPU_ORDER=($(
         for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
-            echo "${GPU_BANDWIDTH[$i]} $i"
-        done | sort -rn | awk '{print $2}'
+            # compute_cap "8.6" -> 86 for integer sort; missing -> 0
+            cc_int=$(awk "BEGIN{printf \"%d\", ${GPU_COMPUTE_CAP[$i]:-0}*10}")
+            printf "%d %d %d %d\n" "${GPU_BANDWIDTH[$i]}" "${GPU_VRAM_TOTAL[$i]}" "$cc_int" "$i"
+        done | sort -k1,1rn -k2,2rn -k3,3rn | awk '{print $NF}'
     ))
 
     for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
