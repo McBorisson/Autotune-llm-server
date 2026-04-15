@@ -1056,6 +1056,19 @@ fi
 
 (( IS_IK_LLAMA )) && echo "Backend: ik_llama.cpp (graph split enabled)" || echo "Backend: llama.cpp (mainline)"
 
+# Backend tag used as cache-key suffix — one tuned/MoE config per backend,
+# since ik-only flags and quant layouts aren't portable.
+BACKEND_TAG="llama"
+(( IS_IK_LLAMA )) && BACKEND_TAG="ik"
+
+# WSL2 detection — pinning memory via --mlock on WSL2 can freeze the Windows
+# host when the guest exhausts its allocation. Gate mlock and similar pinning
+# behind this flag.
+IS_WSL2=0
+if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null; then
+    IS_WSL2=1
+fi
+
 # ═══════════════════════════════════════════════════════════════
 # Section 5: Smart Flag Builder
 
@@ -2182,7 +2195,7 @@ ai_tune() {
     mkdir -p "$CACHE_DIR"
     local vision_suffix=""
     [[ -n "$MMPROJ_PATH" ]] && vision_suffix="_v"
-    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}_${BACKEND_TAG}"
     local tune_cache_suffix=""
     (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
     local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
@@ -2701,7 +2714,7 @@ load_tune_cache() {
     mkdir -p "$CACHE_DIR"
     local vision_suffix=""
     [[ -n "$MMPROJ_PATH" ]] && vision_suffix="_v"
-    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)${vision_suffix}_${BACKEND_TAG}"
     local tune_cache_suffix=""
     (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
     local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
@@ -2807,10 +2820,12 @@ case "$STRATEGY" in
         LAUNCH_FLAGS=(
             -m "$MODEL_PATH" --host "$HOST" --port "$PORT"
             --ctx-size "$CTX_SIZE" --flash-attn on
-            -b 512 -ub 256 -ngl 0 --no-mmap --mlock
+            -b 512 -ub 256 -ngl 0 --no-mmap
             --cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE"
             --jinja --threads "$THREADS_GEN" --threads-batch "$THREADS_BATCH"
         )
+        # Skip --mlock on WSL2 — pinning can freeze the Windows host
+        (( ! IS_WSL2 )) && LAUNCH_FLAGS+=(--mlock)
         [[ -n "$CONTEXT_SHIFT_FLAG" ]] && LAUNCH_FLAGS+=("$CONTEXT_SHIFT_FLAG")
         if (( DRY_RUN )); then
             print_cmd "${LAUNCH_FLAGS[@]}"
@@ -2976,7 +2991,7 @@ esac
 # ═══════════════════════════════════════════════════════════════
 
 mkdir -p "$CACHE_DIR"
-CACHE_KEY_INPUT="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_ctx${CTX_SIZE}_kv${KV_QUALITY}_gpus${GPU_COUNT}"
+CACHE_KEY_INPUT="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_ctx${CTX_SIZE}_kv${KV_QUALITY}_gpus${GPU_COUNT}_be${BACKEND_TAG}"
 [[ -n "$GPUS_FILTER" ]] && CACHE_KEY_INPUT="${CACHE_KEY_INPUT}_filter${GPUS_FILTER}"
 CACHE_KEY=$(echo "$CACHE_KEY_INPUT" | md5sum | awk '{print $1}')
 CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.conf"
@@ -3203,7 +3218,17 @@ if try_start --no-mmap -ot "$OT_STRING"; then
     declare -a ACTUAL_FREE
     for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
         gi=${GPU_ORDER[$i]}
-        ACTUAL_FREE[$gi]=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "${GPU_INDEX[$gi]}" 2>/dev/null | tr -d ' ')
+        raw_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "${GPU_INDEX[$gi]}" 2>/dev/null | tr -d ' ')
+        # nvidia-smi can fail or return blank on WSL2 / driver hiccups. Fall back
+        # to pre-launch free minus an estimate of what we just loaded so the script
+        # doesn't blow up on empty-string arithmetic under pipefail+nounset.
+        if [[ ! "$raw_free" =~ ^[0-9]+$ ]]; then
+            estimated_used=$(( LAYERS_PER_GPU[$gi] * COST_PER_LAYER_MB ))
+            raw_free=$(( GPU_VRAM_FREE[$gi] - estimated_used ))
+            (( raw_free < 0 )) && raw_free=0
+            log "  GPU${GPU_INDEX[$gi]}: nvidia-smi free readback failed, estimating ${raw_free}MB"
+        fi
+        ACTUAL_FREE[$gi]=$raw_free
         log "  GPU${GPU_INDEX[$gi]}: ${ACTUAL_FREE[$gi]}MB free after load"
     done
 
@@ -3264,8 +3289,16 @@ if try_start --no-mmap -ot "$OT_STRING"; then
         echo ""
         echo "Restarting with optimized config (Gentle Load enabled)..."
         # --no-mmap is critical for 397B models to prevent virtual memory blowout
-        # --mlock ensures the 100GB+ in RAM doesn't get swapped out
-        if ! try_start --no-mmap --mlock -ot "$OT_STRING"; then
+        # --mlock pins CPU-resident weights so they don't get swapped — but on
+        # WSL2 that pinning can freeze the Windows host, so we skip it there
+        # and let the Linux page cache handle it.
+        MLOCK_ARGS=()
+        if (( ! IS_WSL2 )); then
+            MLOCK_ARGS=(--mlock)
+        else
+            log "  WSL2 detected — skipping --mlock to avoid host freeze"
+        fi
+        if ! try_start --no-mmap "${MLOCK_ARGS[@]}" -ot "$OT_STRING"; then
             echo "  Optimized config failed — retrying without mlock..."
             kill_server ""
             if ! try_start --no-mmap -ot "$OT_STRING"; then
