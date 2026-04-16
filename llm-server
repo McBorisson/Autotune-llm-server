@@ -43,6 +43,12 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════
 
 VERSION="2.1.0"
+
+# Persistent Configuration — source early so env vars (LLM_PORT, etc.) are available
+CONFIG_DIR="$HOME/.config/llm-server"
+CONFIG_FILE="$CONFIG_DIR/config.sh"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
 PORT="${LLM_PORT:-8081}"
 HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
@@ -58,11 +64,6 @@ COMPUTE_PER_GPU_MB=512           # CUDA context + compute buffers per GPU
 MIN_CRAM_MB=512                  # minimum useful CPU RAM for expert offload
 VRAM_OVERHEAD_PERCENT=130        # model size * this / 100 = estimated VRAM needed
 SINGLE_GPU_HEADROOM_MB=4096      # extra VRAM headroom to fit single-GPU mode
-
-# Persistent Configuration
-CONFIG_DIR="$HOME/.config/llm-server"
-CONFIG_FILE="$CONFIG_DIR/config.sh"
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 # Ensure model directory exists
