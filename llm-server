@@ -371,9 +371,11 @@ if (( DO_UPDATE )); then
         [[ -x "$binary" ]] && old_binary_hash=$(md5sum "$binary" | awk '{print $1}')
         echo "  Current: $(git log --oneline -1)"
 
-        # Backup working binary
+        # Backup working binary OUTSIDE $build_dir, so a clean reconfigure that
+        # wipes build/ can't also destroy the rollback target.
+        local binary_backup="$repo_dir/.llm-server.llama-server.backup"
         if [[ -x "$binary" ]]; then
-            cp "$binary" "${binary}.backup"
+            cp "$binary" "${binary_backup}"
             echo "  Backed up working binary"
         fi
 
@@ -401,7 +403,7 @@ if (( DO_UPDATE )); then
         new_commit=$(git rev-parse HEAD 2>/dev/null)
         if [[ "$old_commit" == "$new_commit" ]]; then
             echo "  Already up to date."
-            rm -f "${binary}.backup"
+            rm -f "${binary_backup}"
             return 0
         fi
         echo "  Updated: $(git log --oneline -1)"
@@ -442,7 +444,7 @@ if (( DO_UPDATE )); then
             echo ""
             echo "  All ${walkback_max} attempts failed — rolling back to previous version..."
             git checkout "$old_commit" 2>/dev/null
-            [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
+            [[ -f "${binary_backup}" ]] && mv "${binary_backup}" "$binary"
             echo "  Rolled back to $(git log --oneline -1)"
             return 1
         fi
@@ -456,7 +458,7 @@ if (( DO_UPDATE )); then
         fi
 
         # Clean up backup
-        rm -f "${binary}.backup"
+        rm -f "${binary_backup}"
         echo "  $name updated: $(git log --oneline -1)"
         return 0
     }
