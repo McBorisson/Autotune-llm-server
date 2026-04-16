@@ -325,9 +325,18 @@ echo ""
 opt_unlimited=0
 if (( opt_aitune )); then
     echo "═══ AI Tune Options ═══"
-    read -rp "  Enable UNLIMITED (deep) mode? [y/N] " unl_ans
+    echo "  Standard: LLM proposes server flags (ctx, batch, KV quant, threads…)"
+    echo "            on top of the safe heuristic baseline. 8 rounds by default."
+    echo "  Deep:     also lets the LLM perturb multi-GPU placement flags"
+    echo "            (--tensor-split, --split-mode, per-device layer counts)."
+    echo "            20 rounds by default. Cached separately from standard."
+    echo ""
+    echo "  Each round reloads the model, so total time ≈ rounds × cold-load."
+    echo "  Crashes during a round get free retries and don't count."
+    echo ""
+    read -rp "  Enable Deep mode (--unlimited)? [y/N] " unl_ans
     case "${unl_ans,,}" in y|yes) opt_unlimited=1 ;; esac
-    
+
     default_rounds=8
     (( opt_unlimited )) && default_rounds=20
     read -rp "  Number of rounds (1-30, default ${default_rounds}): " new_rounds
@@ -335,7 +344,11 @@ if (( opt_aitune )); then
     [[ ! "$opt_rounds" =~ ^[0-9]+$ ]] && opt_rounds=$default_rounds
     (( opt_rounds < 1 )) && opt_rounds=1
     (( opt_rounds > 30 )) && opt_rounds=30
-    echo "  Rounds: $opt_rounds  Unlimited: $(( opt_unlimited ? 1 : 0 ))"
+    if (( opt_unlimited )); then
+        echo "  Mode: Deep (--unlimited)   Rounds: $opt_rounds"
+    else
+        echo "  Mode: Standard             Rounds: $opt_rounds"
+    fi
     echo ""
 fi
 
