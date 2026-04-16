@@ -406,11 +406,6 @@ if (( DO_UPDATE )); then
         fi
         echo "  Updated: $(git log --oneline -1)"
 
-        # Build
-        echo "  Building..."
-        local nproc
-        nproc=$(nproc 2>/dev/null || echo 8)
-
         # Ensure CUDA compiler is discoverable. Many systems have CUDA installed
         # under /usr/local/cuda* but don't put nvcc on PATH; cmake will then fail
         # to reconfigure even when an incremental rebuild would have worked.
@@ -422,106 +417,34 @@ if (( DO_UPDATE )); then
             [[ -n "$_nvcc" ]] && export CUDACXX="$_nvcc" && echo "  Found CUDA: $_nvcc"
         fi
 
-        # Ensure build directory exists with same cmake config
-        if [[ -d "$build_dir" ]]; then
-            # Rebuild with existing cmake cache (preserves CUDA flags etc.)
-            if ! cmake --build "$build_dir" --config Release -j"$nproc" 2>&1 | tail -5; then
-                echo "  Build failed — trying clean reconfigure..."
-                # Extract key cmake flags from the stale cache before wiping
-                local cmake_flags=()
-                if [[ -f "$build_dir/CMakeCache.txt" ]]; then
-                    local val
-                    val=$(grep "^GGML_CUDA:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA=ON)
-                    val=$(grep "^GGML_CUDA_FA_ALL_QUANTS:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_FA_ALL_QUANTS=ON)
-                    val=$(grep "^GGML_CUDA_NCCL:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_NCCL=ON)
-                    val=$(grep "^CMAKE_CUDA_ARCHITECTURES:" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=("-DCMAKE_CUDA_ARCHITECTURES=$(echo "$val" | cut -d= -f2)")
-                    # Preserve the CUDA compiler path if the old cache had a real one
-                    val=$(grep "^CMAKE_CUDA_COMPILER:" "$build_dir/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
-                    if [[ -n "$val" && "$val" != *NOTFOUND* && -x "$val" ]]; then
-                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$val")
-                    elif [[ -n "${CUDACXX:-}" ]]; then
-                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$CUDACXX")
-                    fi
-                fi
-                rm -rf "$build_dir"
-                if cmake -B "$build_dir" -DCMAKE_BUILD_TYPE=Release "${cmake_flags[@]}" 2>&1 | tail -5 \
-                   && cmake --build "$build_dir" --config Release -j"$nproc" 2>&1 | tail -5; then
-                    echo "  Clean rebuild succeeded"
-                else
-                    echo "  BUILD FAILED — rolling back..."
-                    git checkout "$old_commit" 2>/dev/null
-                    [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
-                    echo "  Rolled back to $old_commit"
-                    return 1
-                fi
-            fi
-        else
-            echo "  No build directory — skipping (run cmake manually first)"
-            git checkout "$old_commit" 2>/dev/null
-            return 1
-        fi
-
-        # Verify new binary exists and runs
-        if [[ ! -x "$binary" ]]; then
-            echo "  Binary missing after build — rolling back..."
-            git checkout "$old_commit" 2>/dev/null
-            [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
-            return 1
-        fi
-
-        # Quick smoke test: binary can print help without crashing
-        if ! timeout 10 "$binary" --help >/dev/null 2>&1; then
-            echo "  Binary crashes on --help — rolling back..."
-            git checkout "$old_commit" 2>/dev/null
-            [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
-            echo "  Rolled back to $old_commit"
-            return 1
-        fi
-
-        # Deep test: try loading the smallest real model to verify it works
-        # Pick smallest .gguf, skipping projector/mmproj files (not loadable standalone)
-        local test_model=""
-        test_model=$(ls -S ~/ai_models/*.gguf 2>/dev/null \
-            | grep -viE 'mmproj|projector' \
-            | tail -1)
-
-        if [[ -n "$test_model" ]]; then
-            echo "  Testing model launch: $(basename "$test_model")"
-            # Pick a free port to avoid colliding with a running server
-            local test_port
-            test_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo 18081)
-            # Load model with minimal context; kill as soon as server reports ready.
-            # Accept multiple "ready" markers across llama.cpp / ik_llama.cpp versions.
-            local test_log
-            test_log=$(mktemp)
-            timeout 120s "$binary" -m "$test_model" \
-                --ctx-size 512 --parallel 1 --port "$test_port" \
-                --host 127.0.0.1 -ngl 0 > "$test_log" 2>&1 &
-            local test_pid=$!
-            local ready=0
-            for _ in $(seq 1 120); do
-                if grep -qE "server is listening|main loop|model loaded|HTTP server listening" "$test_log"; then
-                    ready=1; break
-                fi
-                kill -0 "$test_pid" 2>/dev/null || break
-                sleep 1
-            done
-            kill "$test_pid" 2>/dev/null; wait "$test_pid" 2>/dev/null
-            if (( ready )); then
-                echo "  Model launch test: PASSED ✓"
-                rm -f "$test_log"
+        # Bounded walk-back: if HEAD fails to build/test, try up to N-1 parent
+        # commits before giving up. Handles transient upstream regressions
+        # (e.g. HEAD crashes on --help) without falling back all the way to the
+        # previously-installed version. Override with LLM_SERVER_UPDATE_WALKBACK.
+        local walkback_max="${LLM_SERVER_UPDATE_WALKBACK:-3}"
+        local attempt success=0 target_commit
+        for (( attempt=0; attempt < walkback_max; attempt++ )); do
+            if (( attempt == 0 )); then
+                target_commit="$new_commit"
             else
-                echo "  Model launch test: FAILED — rolling back..."
-                echo "  --- last 10 lines of test output ---"
-                tail -10 "$test_log" | sed 's/^/    /'
-                rm -f "$test_log"
-                git checkout "$old_commit" 2>/dev/null
-                [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
-                echo "  Rolled back to $old_commit"
-                return 1
+                target_commit=$(git rev-parse "${new_commit}~${attempt}" 2>/dev/null) || break
+                echo ""
+                echo "  ── Attempt $((attempt+1))/${walkback_max}: walking back to $(git log --oneline -1 "$target_commit") ──"
+                git checkout --quiet "$target_commit" 2>/dev/null || { echo "  checkout failed; stopping walk-back"; break; }
             fi
-        else
-            echo "  Skipping model test (no GGUF models found)"
+            if _update_build_and_test "$build_dir" "$binary"; then
+                success=1
+                break
+            fi
+        done
+
+        if (( !success )); then
+            echo ""
+            echo "  All ${walkback_max} attempts failed — rolling back to previous version..."
+            git checkout "$old_commit" 2>/dev/null
+            [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
+            echo "  Rolled back to $(git log --oneline -1)"
+            return 1
         fi
 
         local new_binary_hash
@@ -536,6 +459,96 @@ if (( DO_UPDATE )); then
         rm -f "${binary}.backup"
         echo "  $name updated: $(git log --oneline -1)"
         return 0
+    }
+
+    # Build + smoke-test at whatever commit is currently checked out. No
+    # rollback side effects — caller decides what to do on failure. Returns 0
+    # on success, non-zero on any build / smoke-test / model-launch failure.
+    _update_build_and_test() {
+        local build_dir="$1" binary="$2"
+        local nproc
+        nproc=$(nproc 2>/dev/null || echo 8)
+
+        echo "  Building..."
+        if [[ -d "$build_dir" ]]; then
+            if ! cmake --build "$build_dir" --config Release -j"$nproc" 2>&1 | tail -5; then
+                echo "  Build failed — trying clean reconfigure..."
+                local cmake_flags=()
+                if [[ -f "$build_dir/CMakeCache.txt" ]]; then
+                    local val
+                    val=$(grep "^GGML_CUDA:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA=ON)
+                    val=$(grep "^GGML_CUDA_FA_ALL_QUANTS:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_FA_ALL_QUANTS=ON)
+                    val=$(grep "^GGML_CUDA_NCCL:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_NCCL=ON)
+                    val=$(grep "^CMAKE_CUDA_ARCHITECTURES:" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=("-DCMAKE_CUDA_ARCHITECTURES=$(echo "$val" | cut -d= -f2)")
+                    val=$(grep "^CMAKE_CUDA_COMPILER:" "$build_dir/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+                    if [[ -n "$val" && "$val" != *NOTFOUND* && -x "$val" ]]; then
+                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$val")
+                    elif [[ -n "${CUDACXX:-}" ]]; then
+                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$CUDACXX")
+                    fi
+                fi
+                rm -rf "$build_dir"
+                if ! { cmake -B "$build_dir" -DCMAKE_BUILD_TYPE=Release "${cmake_flags[@]}" 2>&1 | tail -5 \
+                      && cmake --build "$build_dir" --config Release -j"$nproc" 2>&1 | tail -5; }; then
+                    echo "  Build failed at this commit."
+                    return 1
+                fi
+                echo "  Clean rebuild succeeded"
+            fi
+        else
+            echo "  No build directory — run cmake manually first."
+            return 1
+        fi
+
+        if [[ ! -x "$binary" ]]; then
+            echo "  Binary missing after build."
+            return 1
+        fi
+
+        # Shallow smoke: --version exits 0 on both llama.cpp and ik_llama.cpp.
+        # (Note: ik_llama's --help exits 1 by design, so --help is not portable.)
+        if ! timeout 10 "$binary" --version >/dev/null 2>&1; then
+            echo "  Binary crashes on --version at this commit."
+            return 1
+        fi
+
+        # Deep smoke: load smallest real model in a dedicated process on a
+        # free port; accept any of several version-robust "ready" markers.
+        local test_model
+        test_model=$(ls -S ~/ai_models/*.gguf 2>/dev/null \
+            | grep -viE 'mmproj|projector' \
+            | tail -1)
+        if [[ -z "$test_model" ]]; then
+            echo "  Skipping model launch test (no GGUF models found)"
+            return 0
+        fi
+        echo "  Testing model launch: $(basename "$test_model")"
+        local test_port
+        test_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo 18081)
+        local test_log
+        test_log=$(mktemp)
+        timeout 120s "$binary" -m "$test_model" \
+            --ctx-size 512 --parallel 1 --port "$test_port" \
+            --host 127.0.0.1 -ngl 0 > "$test_log" 2>&1 &
+        local test_pid=$! ready=0
+        for _ in $(seq 1 120); do
+            if grep -qE "server is listening|main loop|model loaded|HTTP server listening" "$test_log"; then
+                ready=1; break
+            fi
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill "$test_pid" 2>/dev/null; wait "$test_pid" 2>/dev/null
+        if (( ready )); then
+            echo "  Model launch test: PASSED ✓"
+            rm -f "$test_log"
+            return 0
+        fi
+        echo "  Model launch test: FAILED at this commit"
+        echo "  --- last 10 lines of test output ---"
+        tail -10 "$test_log" | sed 's/^/    /'
+        rm -f "$test_log"
+        return 1
     }
 
     echo "═══ llm-server backend updater ═══"
