@@ -2763,15 +2763,19 @@ print(json.dumps(msgs))
 
         # Record result (local + persistent history)
         echo "$config_name" > "$tune_msg_dir/name_${round}.txt"
-        all_results=$(python3 -c "
-import json, sys
+        all_results=$(CONFIG_FLAGS_JSON="$config_flags_json" python3 -c "
+import json, os, sys
 results = json.loads(sys.stdin.read())
+try:
+    flags_obj = json.loads(os.environ.get('CONFIG_FLAGS_JSON', '{}'))
+except json.JSONDecodeError:
+    flags_obj = {}
 results.append({
     'round': ${round},
     'name': open('${tune_msg_dir}/name_${round}.txt').read().strip(),
     'gen_tps': ${round_gen},
     'pp_tps': ${round_pp},
-    'flags': json.loads('${config_flags_json}'),
+    'flags': flags_obj,
     'status': '${round_status}'
 })
 print(json.dumps(results))
@@ -2844,9 +2848,13 @@ print(f'  Saved marker to: ${tune_cache}')
 
         # Save to cache
         echo "$best_name" > "$tune_msg_dir/best_name.txt"
-        python3 -c "
-import json
+        BEST_FLAGS_JSON="$best_flags_json" python3 -c "
+import json, os
 from datetime import datetime
+try:
+    best_flags = json.loads(os.environ.get('BEST_FLAGS_JSON', '{}'))
+except json.JSONDecodeError:
+    best_flags = {}
 cache = {
     'model': '${MODEL_NAME}',
     'tuned_at': datetime.utcnow().isoformat() + 'Z',
@@ -2855,7 +2863,7 @@ cache = {
     'baseline_pp_tps': ${baseline_pp},
     'best_config': {
         'name': open('${tune_msg_dir}/best_name.txt').read().strip(),
-        'flags': json.loads('${best_flags_json}'),
+        'flags': best_flags,
         'gen_tps': ${best_gen},
         'pp_tps': ${best_pp},
     },
